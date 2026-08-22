@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Numerics;
 
@@ -33,6 +33,16 @@ public class SlidePathGenerator
     public void LineToPoint(Complex point)
     {
         PathSegments.Add(new ParametricSlidePath.LineSegment(CurrentEndPoint, point));
+        CurrentEndPoint = point;
+    }
+
+    /// <summary>
+    /// 极坐标弧（圆心 = 原点）：'>' 顺时针、'&lt;' 逆时针、'^' 最短方向。
+    /// 与 LineToPoint 同栈形：从 CurrentEndPoint 弧到 point。
+    /// </summary>
+    public void PolarArcToPoint(Complex point, char shape)
+    {
+        PathSegments.Add(new ParametricSlidePath.PolarArcSegment(CurrentEndPoint, point, shape));
         CurrentEndPoint = point;
     }
 
