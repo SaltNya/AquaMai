@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
@@ -16,14 +16,17 @@ public static class SlideCodeParser
         NodeC = 2,
         OrbitCCW = 3,
         OrbitCW = 4,
-        NodeEnd = 5
+        NodeEnd = 5,
+        NodeE = 6,
+        NodeD = 7
     }
 
-    public struct Command(CommandType type, int value)
+    public struct Command(CommandType type, int value, char shape)
     {
         public CommandType Type = type;
         public int Value = value;
-        
+        public char Shape = shape;   // '-' 直线（默认）、'<' 逆时针弧、'>' 顺时针弧、'^' 最短弧
+
         public static bool IsSame(Command a, Command b)
         {
             return a.Type == b.Type && a.Value == b.Value;
@@ -32,7 +35,13 @@ public static class SlideCodeParser
 
     public static readonly char[] CommandChars =
     [
-        'A', 'B', 'C', 'P', 'Q', 'K'
+        'A', 'B', 'C', 'P', 'Q', 'K', 'E', 'D'
+    ];
+
+    // 弧线连接符（Majdata touch-slide 的 < > ^）：修饰下一个节点命令的连接方式
+    public static readonly char[] ArcShapes =
+    [
+        '<', '>', '^'
     ];
 
     public static int TryParseDigit(char c)
@@ -43,32 +52,71 @@ public static class SlideCodeParser
 
     public static List<Command> ParseCommands(string code)
     {
-        if (!CommandChars.Contains(code[1]))
+        if (code.Length < 3)
         {
-            throw new ArgumentException($"the 2nd char should be a command");
+            throw new ArgumentException($"code too short");
         }
 
         if (code[code.Length - 2] != 'K')
         {
             throw new ArgumentException($"should end with 'K' command");
         }
-        
+
         var commands = new List<Command>();
-        var currentType = CommandType.NodeA;
-        var value = TryParseDigit(code[0]);
-        if (value < 0) throw new ArgumentException($"invalid char '{code[0]}'");
-        
-        commands.Add(new Command(currentType, value));
-        
-        for (var ptr = 1; ptr < code.Length; ptr++)
+        var currentShape = '-';
+        var startPtr = 1;
+
+        // 起点：数字 = A 环节点（按键环，兼容旧语法，如 "1K5"）；
+        // B/E/C = 非 A 区启动（如 "B1K5" 起点 B1、"E3K5" 起点 E3、"CK5" 起点中心）。
+        var startValue = TryParseDigit(code[0]);
+        if (startValue >= 0)
+        {
+            commands.Add(new Command(CommandType.NodeA, startValue, currentShape));
+            if (!CommandChars.Contains(code[1]) && !ArcShapes.Contains(code[1]))
+            {
+                throw new ArgumentException($"the 2nd char should be a command");
+            }
+        }
+        else
+        {
+            switch (code[0])
+            {
+                case 'B':
+                case 'E':
+                case 'D':
+                    startValue = TryParseDigit(code[1]);
+                    if (startValue < 0) throw new ArgumentException($"invalid char '{code[1]}'");
+                    commands.Add(new Command(
+                        code[0] == 'B' ? CommandType.NodeB :
+                        code[0] == 'E' ? CommandType.NodeE : CommandType.NodeD,
+                        startValue, currentShape));
+                    startPtr = 2;
+                    break;
+                case 'C':
+                    commands.Add(new Command(CommandType.NodeC, 0, currentShape));
+                    break;
+                default:
+                    throw new ArgumentException($"invalid char '{code[0]}'");
+            }
+        }
+
+        var currentType = commands[0].Type;
+        var value = 0;
+        for (var ptr = startPtr; ptr < code.Length; ptr++)
         {
             var ch = code[ptr];
-            if (CommandChars.Contains(ch))
+            if (ArcShapes.Contains(ch))
+            {
+                // 弧线连接符：修饰下一个节点命令的连接方式
+                currentShape = ch;
+            }
+            else if (CommandChars.Contains(ch))
             {
                 currentType = (CommandType) Array.IndexOf(CommandChars, ch);
                 if (currentType == CommandType.NodeC)
                 {
-                    commands.Add(new Command(CommandType.NodeC, 0));
+                    commands.Add(new Command(CommandType.NodeC, 0, currentShape));
+                    currentShape = '-';
                 }
             }
             else
@@ -79,7 +127,8 @@ public static class SlideCodeParser
                 {
                     throw new ArgumentException($"digit should not follow 'C'");
                 }
-                commands.Add(new Command(currentType, value));
+                commands.Add(new Command(currentType, value, currentShape));
+                currentShape = '-';
             }
         }
         return commands;
@@ -94,6 +143,10 @@ public static class SlideCodeParser
                 return MaiGeometry.PointGroupA(cmd.Value);
             case CommandType.NodeB:
                 return MaiGeometry.PointGroupB(cmd.Value);
+            case CommandType.NodeE:
+                return MaiGeometry.PointGroupE(cmd.Value);
+            case CommandType.NodeD:
+                return MaiGeometry.PointGroupD(cmd.Value);
             case CommandType.NodeC:
                 return MaiGeometry.Center();
             default:
@@ -104,7 +157,15 @@ public static class SlideCodeParser
     public static void NodeToNode(SlidePathGenerator generator, Command last, Command current)
     {
         if (Command.IsSame(last, current)) return;
-        generator.LineToPoint(GetNodePosition(current));
+        if (current.Shape == '-')
+        {
+            generator.LineToPoint(GetNodePosition(current));
+        }
+        else
+        {
+            // 弧线连接（Majdata < > ^）：极坐标弧，圆心 = 屏幕中心
+            generator.PolarArcToPoint(GetNodePosition(current), current.Shape);
+        }
     }
 
     public static void NodeToOrbit(SlidePathGenerator generator, Command last, Command current)
@@ -189,8 +250,8 @@ public static class SlideCodeParser
         {
             var commands = ParseCommands(code);
             var lastCmd = commands[0];
-            // The first command is guarantee to be 'A'
-            var generator = SlidePathGenerator.BeginAt(MaiGeometry.PointGroupA(lastCmd.Value));
+            // 起点按首命令的节点类型取位置（A/B/E/C 均可，非 A 区启动）
+            var generator = SlidePathGenerator.BeginAt(GetNodePosition(commands[0]));
 
             for (var i = 1; i < commands.Count; i++)
             {
@@ -199,12 +260,16 @@ public static class SlideCodeParser
                 {
                     case CommandType.NodeA:
                     case CommandType.NodeB:
+                    case CommandType.NodeE:
+                    case CommandType.NodeD:
                     case CommandType.NodeC:
                     case CommandType.NodeEnd:
                         switch (lastCmd.Type)
                         {
                             case CommandType.NodeA:
                             case CommandType.NodeB:
+                            case CommandType.NodeE:
+                            case CommandType.NodeD:
                             case CommandType.NodeC:
                                 NodeToNode(generator, lastCmd, cmd);
                                 break;
@@ -224,6 +289,8 @@ public static class SlideCodeParser
                         {
                             case CommandType.NodeA:
                             case CommandType.NodeB:
+                            case CommandType.NodeE:
+                            case CommandType.NodeD:
                             case CommandType.NodeC:
                                 NodeToOrbit(generator, lastCmd, cmd);
                                 break;
