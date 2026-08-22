@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Numerics;
 
 namespace AquaMai.Mods.Fancy.GamePlay.CustomNoteTypes.Libs;
@@ -15,6 +15,12 @@ public static class MaiGeometry
     public static readonly double MainRadius  = 480.0;
     public static readonly double CenterRadius = MainRadius * Math.Cos(Math.PI * 3 / 8);
     public static readonly double GroupBRadius = CenterRadius / Math.Cos(Math.PI / 8);
+
+    // E 环（Majdata E 区）：半径 3.0×105 ≈ 315，位于 A(440)/B(210) 之间，角度错开 22.5°（在 A/B 位之间）
+    public static readonly double ERadius = 315.0;
+
+    // D 环（Majdata D 区 touch）：半径 4.1×105 = 430.5，与 A 环同半径、角度与 E 区一致（错开 22.5°）
+    public static readonly double DRadius = 430.5;
 
     private static readonly double _b = Math.Cos(Math.PI / 8) / 2;
     private static readonly double _a = 1 - _b;
@@ -54,6 +60,26 @@ public static class MaiGeometry
     {
         var angle = Math.PI * (5.0 / 8.0 - idx / 4.0);
         return Complex.FromPolarCoordinates(GroupBRadius, angle);
+    }
+
+    /// <summary>
+    /// E 环节点（Majdata E 区）：半径 ERadius，角度错开 A/B 位 22.5°。
+    /// Note: idx is 1-based, not 0-based
+    /// </summary>
+    public static Complex PointGroupE(int idx)
+    {
+        var angle = Math.PI * (3.0 / 4.0 - idx / 4.0);
+        return Complex.FromPolarCoordinates(ERadius, angle);
+    }
+
+    /// <summary>
+    /// D 环节点（Majdata D 区 touch）：半径 DRadius（与 A 环相同 4.1），角度与 E 区一致。
+    /// Note: idx is 1-based, not 0-based
+    /// </summary>
+    public static Complex PointGroupD(int idx)
+    {
+        var angle = Math.PI * (3.0 / 4.0 - idx / 4.0);
+        return Complex.FromPolarCoordinates(DRadius, angle);
     }
     
     public static Complex Center()
