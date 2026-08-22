@@ -1,5 +1,9 @@
 # AquaMai
 
+## 附加
+将CustomNoteTypes.zip放置在".\LocalAssets\CustomNoteTypes"路径下以加载贴图
+主要修改了AquaMai.Mods.Fancy.GamePlay.CustomNoteTypes 需要在设置里开启
+
 ## Installation
 
 1. Build the project or find an existing build somewhere™
