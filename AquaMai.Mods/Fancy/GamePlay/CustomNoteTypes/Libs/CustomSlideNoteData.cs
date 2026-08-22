@@ -1,8 +1,6 @@
-﻿using System.Collections.Generic;
-using System.Linq;
+using System.Collections.Generic;
 using DB;
 using Manager;
-using MelonLoader;
 using UnityEngine;
 
 namespace AquaMai.Mods.Fancy.GamePlay.CustomNoteTypes.Libs;
@@ -39,10 +37,6 @@ public class CustomSlideNoteData: NoteData
             SlidePathList.Add(SlideDataBuilder.ConvertAndRotateArrowData(arrowData, i, mirrorMode));
             SlideHitAreasList.Add(SlideDataBuilder.ConvertAndRotateHitAreas(hitAreaData, i, mirrorMode));
         }
-
-        var msg = string.Join(", ",
-            hitAreaData.Select(x => x.PanelAreas).Select(x => string.Join("/", x.Cast<InputManager.TouchPanelArea>())));
-        MelonLogger.Msg(msg);
 
         this.slideData.type = path.GetEndType(mirrorMode);
 
