@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Numerics;
 using DB;
@@ -345,6 +345,7 @@ public static class SlideDataBuilder
         var totalLength = path.GetPathLength();
         var count = (int)Math.Round(totalLength / 10.0);
         int? lastNode = null;
+        int? lastNonNullNode = null;
         var enterLength = 0.0;
         for (var i = 0; i < count; i++)
         {
@@ -370,6 +371,23 @@ public static class SlideDataBuilder
                     node = j | 8;
                     break;
                 }
+
+                // E 环：半径 315，角度错开 A/B 位 22.5°（Majdata E 区）。
+                // 注意 phi 用 (j+1)：E 面板 idx 是 1-based，j=0 对应 E1（角度 π/2）。
+                var phiE = Math.PI * (3.0 / 4.0 - (j + 1) / 4.0);
+                if ((pt - Complex.FromPolarCoordinates(MaiGeometry.ERadius, phiE)).Magnitude < 45.0)
+                {
+                    node = j + 26;
+                    break;
+                }
+
+                // D 环：半径 430.5（与 A 同半径），角度同 E 区错位（Majdata D 区）。
+                var phiD = Math.PI * (3.0 / 4.0 - (j + 1) / 4.0);
+                if ((pt - Complex.FromPolarCoordinates(MaiGeometry.DRadius, phiD)).Magnitude < 45.0)
+                {
+                    node = j + 18;
+                    break;
+                }
             }
 
             if (lastNode != node)
@@ -389,9 +407,18 @@ public static class SlideDataBuilder
                 }
             }
             
+            if (node != null) lastNonNullNode = node;
             lastNode = node;
         }
-        nodeList.Add(new Tuple<int, double>(lastNode!.Value, totalLength));
+
+        // 兜底：路径终点附近没命中任何面板（自由路径/自定义节点）时取最后一个命中面板，
+        // 彻底避免 lastNode 为 null 崩溃（Nullable.get_Value）。
+        if (lastNode == null)
+        {
+            lastNode = lastNonNullNode ?? 16;
+        }
+
+        nodeList.Add(new Tuple<int, double>(lastNode.Value, totalLength));
         nodeList[0] = new Tuple<int, double>(nodeList[0].Item1, 0.0);
         
         var result = new List<HitAreaData>();
@@ -400,7 +427,9 @@ public static class SlideDataBuilder
         {
             var key = (nodeList[i - 1].Item1 << 5) | nodeList[i].Item1;
             var segmentLength = nodeList[i].Item2 - nodeList[i - 1].Item2;
-            var data = HitAreasLookup[key];
+            var data = HitAreasLookup.TryGetValue(key, out var lookupData)
+                ? lookupData
+                : FallbackHitAreas(nodeList[i - 1].Item1, nodeList[i].Item1);
             var area = result[result.Count - 1];
             result[result.Count - 1] = new HitAreaData(
                 area.PushDistance + segmentLength * data[0].PushDistance,
@@ -420,26 +449,189 @@ public static class SlideDataBuilder
         double lastPushDistance = 0.0;
         if (path.GetEndType(OptionMirrorID.Normal) == SlideType.Slide_Straight)
         {
-            var diff = nodeList[nodeList.Count - 1].Item1 - nodeList[nodeList.Count - 2].Item1;
-            diff %= 8;
-            lastPushDistance = diff switch
+            // 单面板退化路径（零长 slide code 如 "1K1"）：nodeList 仅 1 项，
+            // 无跨面板 diff 可算——取默认 159.0，避免 [Count-2] 越界崩溃。
+            if (nodeList.Count >= 2)
             {
-                1 or 2 or 6 or 7 => 130.0,
-                _ => 159.0
-            };
+                var diff = nodeList[nodeList.Count - 1].Item1 - nodeList[nodeList.Count - 2].Item1;
+                diff %= 8;
+                lastPushDistance = diff switch
+                {
+                    1 or 2 or 6 or 7 => 130.0,
+                    _ => 159.0
+                };
+            }
+            else
+            {
+                lastPushDistance = 159.0;
+            }
         }
         else
         {
             lastPushDistance = 175.0;
         }
-        
-        var last2ndArea = result[result.Count - 2];
-        var lastArea = result[result.Count - 1];
-        var distance = last2ndArea.ReleaseDistance + lastArea.PushDistance + lastArea.ReleaseDistance;
-        result[result.Count - 2] = new HitAreaData(last2ndArea.PushDistance, distance - lastPushDistance, last2ndArea.PanelAreas);
-        result[result.Count - 1] = new HitAreaData(lastPushDistance, 0.0, lastArea.PanelAreas);
+
+        // 单面板退化路径：result 仅 1 项（成对循环未执行），无"倒数第二区"可调整，
+        // 跳过尾部收尾修正，避免 [Count-2] 越界崩溃。
+        if (result.Count >= 2)
+        {
+            var last2ndArea = result[result.Count - 2];
+            var lastArea = result[result.Count - 1];
+            var distance = last2ndArea.ReleaseDistance + lastArea.PushDistance + lastArea.ReleaseDistance;
+            result[result.Count - 2] = new HitAreaData(last2ndArea.PushDistance, distance - lastPushDistance, last2ndArea.PanelAreas);
+            result[result.Count - 1] = new HitAreaData(lastPushDistance, 0.0, lastArea.PanelAreas);
+        }
 
         return result;
+    }
+
+
+    
+    /// <summary>
+    /// HitAreasLookup 未覆盖的组合（E 环相关）的简易生成。
+    /// 数值参照 B 环表比例（E 半径 315 介于 A 440 / B 210 之间）。
+    /// </summary>
+    private static HitAreaData[] FallbackHitAreas(int prev, int next)
+    {
+        bool IsE(int n) => n >= 26;
+        bool IsD(int n) => n >= 18 && n < 26;
+
+        // D 环（半径 430.5，与 A 同半径、角度错开 22.5°）环内组合：比例同 E 环。
+        if (IsD(prev) && IsD(next))
+        {
+            var diff = (next - prev) & 7;
+            switch (diff)
+            {
+                case 1:
+                case 7:
+                    return
+                    [
+                        new HitAreaData(0.35, 0.65, [prev]),
+                        new HitAreaData(1.00, 1.00, [next])
+                    ];
+                case 2:
+                case 6:
+                {
+                    var mid = prev + 1;
+                    return
+                    [
+                        new HitAreaData(0.25, 0.40, [prev]),
+                        new HitAreaData(0.60, 0.75, [mid, mid + 1]),
+                        new HitAreaData(1.00, 1.00, [next])
+                    ];
+                }
+                case 3:
+                case 5:
+                {
+                    var mid = prev + 1;
+                    return
+                    [
+                        new HitAreaData(0.20, 0.32, [prev]),
+                        new HitAreaData(0.45, 0.55, [mid, mid + 1]),
+                        new HitAreaData(0.68, 0.80, [mid + 2, mid + 3]),
+                        new HitAreaData(1.00, 1.00, [next])
+                    ];
+                }
+                default:
+                    return
+                    [
+                        new HitAreaData(0.50, 0.50, [prev]),
+                        new HitAreaData(1.00, 1.00, [next])
+                    ];
+            }
+        }
+
+        if (IsE(prev) && IsE(next))
+        {
+            var diff = (next - prev) & 7;
+            switch (diff)
+            {
+                case 1:
+                case 7:
+                    return
+                    [
+                        new HitAreaData(0.35, 0.65, [prev]),
+                        new HitAreaData(1.00, 1.00, [next])
+                    ];
+                case 2:
+                case 6:
+                {
+                    var mid = prev + 1;
+                    return
+                    [
+                        new HitAreaData(0.25, 0.40, [prev]),
+                        new HitAreaData(0.60, 0.75, [mid, mid + 1]),
+                        new HitAreaData(1.00, 1.00, [next])
+                    ];
+                }
+                case 3:
+                case 5:
+                {
+                    var mid = prev + 1;
+                    return
+                    [
+                        new HitAreaData(0.20, 0.32, [prev]),
+                        new HitAreaData(0.45, 0.55, [mid, mid + 1]),
+                        new HitAreaData(0.68, 0.80, [mid + 2, mid + 3]),
+                        new HitAreaData(1.00, 1.00, [next])
+                    ];
+                }
+                default:
+                    return
+                    [
+                        new HitAreaData(0.50, 0.50, [prev]),
+                        new HitAreaData(1.00, 1.00, [next])
+                    ];
+            }
+        }
+
+        if (IsE(prev) || IsE(next))
+        {
+            // A-E / E-A / B-E / E-B / E-C / C-E：基本两段（起点面板 → 终点面板）
+            double push = 0.40, release = 0.65;
+            if (prev == 16 || next == 16)
+            {
+                push = 0.45; release = 0.65;   // 参照 C-B
+            }
+            else if (prev < 16 && next < 16)
+            {
+                push = 0.45; release = 0.70;   // 参照 A-B
+            }
+            return
+            [
+                new HitAreaData(push, release, [prev]),
+                new HitAreaData(1.00, 1.00, [next])
+            ];
+        }
+
+        // 其余组合兜底（理论不可达）
+        return
+        [
+            new HitAreaData(0.40, 0.60, [prev]),
+            new HitAreaData(1.00, 1.00, [next])
+        ];
+    }
+
+    /// <summary>
+    /// 面板镜像：MirrorInfo 表只覆盖 A/B/C（0-16），E 环（26-33）按同环位置镜像规则扩展。
+    /// </summary>
+    private static int MirrorPanel(int pad, int mirrorMode)
+    {
+        if (pad >= 26) return 26 + MaiGeometry.MirrorInfo[mirrorMode, pad - 26];
+        if (pad >= 18) return 18 + MaiGeometry.MirrorInfo[mirrorMode, pad - 18];
+        return MaiGeometry.MirrorInfo[mirrorMode, pad];
+    }
+
+    /// <summary>
+    /// 面板所属环的基值：A=0, B=8, C=16, D=18, E=26（环内位置 = 面板 - 基值）。
+    /// </summary>
+    private static int RingBase(int panel)
+    {
+        if (panel < 8) return 0;
+        if (panel < 16) return 8;
+        if (panel < 18) return 16;
+        if (panel < 26) return 18;
+        return 26;
     }
 
 
@@ -462,8 +654,10 @@ public static class SlideDataBuilder
             hitArea.ReleaseDistance = hitAreaData.ReleaseDistance;
             foreach (var pad in hitAreaData.PanelAreas)
             {
-                var converted = MaiGeometry.MirrorInfo[(int) mirrorMode, pad];
-                converted = converted == 16 ? 16 : (converted - starButton) & 0b111 | converted & 0b1000;
+                var converted = MirrorPanel(pad, (int) mirrorMode);
+                converted = converted == 16
+                    ? 16
+                    : RingBase(converted) + ((converted - RingBase(converted) - starButton) & 7);
                 hitArea.HitPoints.Add((InputManager.TouchPanelArea) converted);
             }
             hitAreaList.Add(hitArea);
