@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
@@ -133,6 +133,80 @@ public class ParametricSlidePath
         public override double GetSegmentLength()
         {
             return Math.PI * Circle.Radius * 2;
+        }
+    }
+
+    /// <summary>
+    /// 极坐标弧（移植 Majdata TouchSlideDrop.AppendSegment 非 C 分支）：
+    /// 圆心 = 原点（屏幕中心），角度从 StartAngle 线性扫过 DeltaAngle，
+    /// 半径按 SmoothStep(t) 从 StartRadius 过渡到 EndRadius。
+    /// 形状：'>' 顺时针、'&lt;' 逆时针、'^'/其他 取最短方向。
+    /// </summary>
+    public class PolarArcSegment(Complex start, Complex end, char shape) : PathSegment
+    {
+        public readonly double StartAngle = start.Phase;
+        public readonly double EndAngle = end.Phase;
+        public readonly double StartRadius = start.Magnitude;
+        public readonly double EndRadius = end.Magnitude;
+        public readonly double DeltaAngle = ResolveAngleDelta(start.Phase, end.Phase, shape);
+
+        public override bool DoAngleLerp { get; } = true;
+
+        public static double ResolveAngleDelta(double start, double end, char shape)
+        {
+            var ccw = Repeat(end - start, Math.PI * 2);
+            var cw = -Repeat(start - end, Math.PI * 2);
+            return shape switch
+            {
+                '>' => cw,
+                '<' => ccw,
+                _ => Math.Abs(cw) <= Math.Abs(ccw) ? cw : ccw
+            };
+        }
+
+        private static double Repeat(double x, double len)
+        {
+            return x - Math.Floor(x / len) * len;
+        }
+
+        private static double SmoothStep(double t)
+        {
+            return t * t * (3 - 2 * t);
+        }
+
+        public override Complex GetPointAt(double t)
+        {
+            var angle = StartAngle + DeltaAngle * t;
+            var radius = StartRadius + (EndRadius - StartRadius) * SmoothStep(t);
+            return Complex.FromPolarCoordinates(radius, angle);
+        }
+
+        public override Complex GetTangentAt(double t)
+        {
+            // 切线 = dr/dt×e_r + r×dθ/dt×e_θ
+            var ds = 6 * t * (1 - t); // SmoothStep'
+            var dr = (EndRadius - StartRadius) * ds;
+            var angle = StartAngle + DeltaAngle * t;
+            var radius = StartRadius + (EndRadius - StartRadius) * SmoothStep(t);
+            var er = Complex.FromPolarCoordinates(1, angle);
+            var eTheta = er * Complex.ImaginaryOne;
+            var tangent = dr * er + (radius * DeltaAngle) * eTheta;
+            return tangent / tangent.Magnitude;
+        }
+
+        public override double GetSegmentLength()
+        {
+            // 极坐标弧不是精确圆弧，数值积分
+            const int steps = 64;
+            var len = 0.0;
+            var prev = GetPointAt(0);
+            for (var i = 1; i <= steps; i++)
+            {
+                var p = GetPointAt((double)i / steps);
+                len += (p - prev).Magnitude;
+                prev = p;
+            }
+            return len;
         }
     }
     
