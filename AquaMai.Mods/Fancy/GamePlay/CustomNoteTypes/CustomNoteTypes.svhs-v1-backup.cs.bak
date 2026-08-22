@@ -1,0 +1,3824 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Reflection.Emit;
+using AquaMai.Config.Attributes;
+using AquaMai.Core.Attributes;
+using AquaMai.Core.Helpers;
+using DB;
+using HarmonyLib;
+using MAI2.Util;
+using Manager;
+using MelonLoader;
+using Monitor;
+using Monitor.Game;
+using Process;
+using UnityEngine;
+using AquaMai.Mods.Fancy.GamePlay.CustomNoteTypes.Libs;
+
+namespace AquaMai.Mods.Fancy.GamePlay.CustomNoteTypes;
+
+[ConfigCollapseNamespace]
+[ConfigSection(
+    name: "自定义 Note 类型",
+    en: "Custom Note Types."
+)]
+public class CustomNoteTypes
+{
+    /*
+     * ========== ========== ========== ========== ========== ========== ========== ==========
+     * 以下内容是为了添加新的 MA2 语法用于表示自定义的 note 类型
+     * The following part is to add new MA2 command to Sinmai (representing custom note types)
+     *
+     * New note types:
+     *     1. Slide Super-new Super-hot (NMSSS, BRSSS, EXSSS, BXSSS, CNSSS):
+     *         Definition: ??SSS [bar] [grid] [start pos] [wait] [duration] [end pos] [slide code (string)]
+     *         Optional extra field: [speed multiplier], e.g. x0.5 or -1
+     *         Represent a slide note with highly customized path (using slide code)
+     *
+     * Hyper Speed (optional trailing field on any MA2 note):
+     *         You can append one extra value at the end of an existing MA2 note line.
+     *         If present, it is treated as that note's speed multiplier.
+     *         Examples:
+     *             NMTTP 1 0 5 E 0 M1 0.5
+     *             NMTAP 9 96 5 x0.5
+     *             NMSTR 7 0 2 -1
+     *         If absent, the note uses the normal/default speed.
+     *         This is an experimental per-note speed override.
+     *
+     * 待办（含历史 TODO）统一见同目录 TODO.md：
+     *   - Mine notes ✅（已完成，见 MINE_NOTES.md）
+     *   - Individual tracing duration in conn. slides
+     *   - Touch-slides / slides not ending in group A
+     *   - Non-C TouchHold（B 已建池，C 绝赞缺池）
+     *   - Spinning tailless star (1$$)
+     *   - D 区 / Touch Slide / rp-rq（对照 MajdataViewAlpha 功能差距）
+     */
+    public static int TotalMa2RecordCount = -1;
+    public static int LastMa2RecordID = -1;
+    public static Array Ma2FileRecordData;
+
+    // Hyper Speed: per-note speed overrides keyed by the actual NoteData instance and by note index.
+    private static readonly Dictionary<NoteData, float> NoteSpeedMultipliers = new Dictionary<NoteData, float>();
+    private static readonly Dictionary<int, float> NoteSpeedByIndex = new Dictionary<int, float>();
+    private static readonly Queue<float> PendingNoteSpeedMultipliers = new Queue<float>();
+    private static readonly Queue<float> PendingTouchSpeedMultipliers = new Queue<float>();
+    private static NoteData _currentNoteData;
+    private static int _noteCountBeforeLoad;
+    private static float? _optionalSpeedForCurrentLoad;
+    private static string _removedOptionalSpeedString;
+    private static bool _optionalSpeedRemoved;
+
+    // Custom note kind classification.
+    public enum CustomNoteKind
+    {
+        None,
+        Mine,
+        CriticalTouch,
+        MineCriticalTouch,
+    }
+
+    private static readonly Dictionary<int, CustomNoteKind> NoteKinds = new Dictionary<int, CustomNoteKind>();
+
+    // 地雷 Note 的独立对象池：每种 note 类型一份（以 object 存放 List<T>），按 GameCtrl 区分。
+    // 池里的对象在创建时就换好地雷贴图，和普通 Note 池互不污染。
+    private static readonly Dictionary<GameCtrl, Dictionary<string, object>> MinePools = new Dictionary<GameCtrl, Dictionary<string, object>>();
+
+    // 当前 RegistNote 调用需要从地雷池取对象的字段名（每种 note 类型对应一或两个池字段）。
+    private static readonly HashSet<string> _activeMineFields = new HashSet<string>();
+
+    // 绝赞 touch（BRTTP，kind=CriticalTouch）的独立池与当前激活字段。
+    // 绝赞不是地雷，但同样需要独立池（组件是 CriticalTouchNoteB，贴图/判定由类自己负责）。
+    private static readonly Dictionary<GameCtrl, Dictionary<string, object>> CriticalTouchPools = new Dictionary<GameCtrl, Dictionary<string, object>>();
+    private static readonly HashSet<string> _activeCriticalFields = new HashSet<string>();
+
+    // RegistNote 中每种 note 类型会读取的池字段。
+    private static readonly string[] MinePoolFieldNames =
+    [
+        "_tapObjectList", "_holdObjectList", "_breakHoldObjectList",
+        "_starObjectList", "_breakStarObjectList", "_breakObjectList",
+        "_touchBObjectList", "_touchCTapObjectList",
+        "_touchBHoldObjectList", "_touchCHoldObjectList",
+        "_slideObjectList", "_fanSlideObjectList",
+        // slide 轨道箭头（RegistNote slide 分支里 SetArrowObject 时读取）
+        "_arrowObjectList", "_breakArrowObjectList",
+    ];
+
+    // 池字段名 -> 对应类型的访问器（transpiler 用）。
+    private static readonly Dictionary<string, MethodInfo> MinePoolGetters = new(StringComparer.Ordinal)
+    {
+        ["_tapObjectList"] = AccessTools.Method(typeof(CustomNoteTypes), nameof(GetTapObjectList)),
+        ["_holdObjectList"] = AccessTools.Method(typeof(CustomNoteTypes), nameof(GetHoldObjectList)),
+        ["_breakHoldObjectList"] = AccessTools.Method(typeof(CustomNoteTypes), nameof(GetBreakHoldObjectList)),
+        ["_starObjectList"] = AccessTools.Method(typeof(CustomNoteTypes), nameof(GetStarObjectList)),
+        ["_breakStarObjectList"] = AccessTools.Method(typeof(CustomNoteTypes), nameof(GetBreakStarObjectList)),
+        ["_breakObjectList"] = AccessTools.Method(typeof(CustomNoteTypes), nameof(GetBreakObjectList)),
+        ["_touchBObjectList"] = AccessTools.Method(typeof(CustomNoteTypes), nameof(GetTouchBObjectList)),
+        ["_touchCTapObjectList"] = AccessTools.Method(typeof(CustomNoteTypes), nameof(GetTouchCTapObjectList)),
+        ["_touchBHoldObjectList"] = AccessTools.Method(typeof(CustomNoteTypes), nameof(GetTouchBHoldObjectList)),
+        ["_touchCHoldObjectList"] = AccessTools.Method(typeof(CustomNoteTypes), nameof(GetTouchCHoldObjectList)),
+        ["_slideObjectList"] = AccessTools.Method(typeof(CustomNoteTypes), nameof(GetSlideObjectList)),
+        ["_fanSlideObjectList"] = AccessTools.Method(typeof(CustomNoteTypes), nameof(GetFanSlideObjectList)),
+        ["_arrowObjectList"] = AccessTools.Method(typeof(CustomNoteTypes), nameof(GetArrowObjectList)),
+        ["_breakArrowObjectList"] = AccessTools.Method(typeof(CustomNoteTypes), nameof(GetBreakArrowObjectList)),
+    };
+
+    private static bool _pendingMineForCurrentLoad;
+    private static bool _pendingCriticalTouchForCurrentLoad;
+
+    // findID is called in a batch before loadNote, so use queues to keep mine flags in chart order.
+    private static readonly Queue<bool> PendingMineFlags = new Queue<bool>();
+    private static readonly Queue<bool> PendingCriticalFlags = new Queue<bool>();
+    private static readonly HashSet<string> AllNoteTypeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    // Mine note textures loaded from LocalAssets/CustomNoteTypes.
+    private static readonly Dictionary<string, Texture2D> MineTextures = new Dictionary<string, Texture2D>();
+    private static bool _mineTexturesLoaded;
+
+
+
+    private static readonly Dictionary<string, string> MineToBaseMap = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["MNTAP"] = "NMTAP",
+        ["MNHLD"] = "NMHLD",
+        ["MNSTR"] = "NMSTR",
+        ["MNSSS"] = "NMSSS",
+        ["MNTTP"] = "NMTTP",
+        ["MNTHO"] = "NMTHO",
+        // Mine variants for native slide types.
+        ["MNSCR"] = "NMSCR",
+        ["MNSCL"] = "NMSCL",
+        ["MNSI_"] = "NMSI_",
+        ["MNSLL"] = "NMSLL",
+        ["MNSLR"] = "NMSLR",
+        ["MNSUL"] = "NMSUL",
+        ["MNSUR"] = "NMSUR",
+        ["MNSXL"] = "NMSXL",
+        ["MNSXR"] = "NMSXR",
+        ["MNSF_"] = "NMSF_",
+        ["MNSV_"] = "NMSV_",
+        ["MNSSL"] = "NMSSL",
+        ["MNSSR"] = "NMSSR",
+        ["MNSL_"] = "NMSL_",
+        ["MNSR_"] = "NMSR_",
+        ["MNSU_"] = "NMSU_",
+        ["MNSD_"] = "NMSD_",
+        ["MNSNL"] = "NMSNL",
+        ["MNSNR"] = "NMSNR",
+        ["MNSFL"] = "NMSFL",
+        ["MNSFR"] = "NMSFR",
+
+        // Mine Break variants.
+        ["MBTAP"] = "BRTAP",
+        ["MBHLD"] = "BRHLD",
+        ["MBSTR"] = "BRSTR",
+        ["MBSSS"] = "BRSSS",
+        ["MBSCR"] = "BRSCR",
+        ["MBSCL"] = "BRSCL",
+        ["MBSI_"] = "BRSI_",
+        ["MBSLL"] = "BRSLL",
+        ["MBSLR"] = "BRSLR",
+        ["MBSUL"] = "BRSUL",
+        ["MBSUR"] = "BRSUR",
+        ["MBSXL"] = "BRSXL",
+        ["MBSXR"] = "BRSXR",
+        ["MBSF_"] = "BRSF_",
+        ["MBSV_"] = "BRSV_",
+        ["MBSSL"] = "BRSSL",
+        ["MBSSR"] = "BRSSR",
+        ["MBSL_"] = "BRSL_",
+        ["MBSR_"] = "BRSR_",
+        ["MBSU_"] = "BRSU_",
+        ["MBSD_"] = "BRSD_",
+        ["MBSNL"] = "BRSNL",
+        ["MBSNR"] = "BRSNR",
+        ["MBSFL"] = "BRSFL",
+        ["MBSFR"] = "BRSFR",
+
+        // Mine ExBreak variants.
+        ["MZTAP"] = "BXTAP",
+        ["MZHLD"] = "BXHLD",
+        ["MZSTR"] = "BXSTR",
+        ["MZSSS"] = "BXSSS",
+        ["MZSCR"] = "BXSCR",
+        ["MZSCL"] = "BXSCL",
+        ["MZSI_"] = "BXSI_",
+        ["MZSLL"] = "BXSLL",
+        ["MZSLR"] = "BXSLR",
+        ["MZSUL"] = "BXSUL",
+        ["MZSUR"] = "BXSUR",
+        ["MZSXL"] = "BXSXL",
+        ["MZSXR"] = "BXSXR",
+        ["MZSF_"] = "BXSF_",
+        ["MZSV_"] = "BXSV_",
+        ["MZSSL"] = "BXSSL",
+        ["MZSSR"] = "BXSSR",
+        ["MZSL_"] = "BXSL_",
+        ["MZSR_"] = "BXSR_",
+        ["MZSU_"] = "BXSU_",
+        ["MZSD_"] = "BXSD_",
+        ["MZSNL"] = "BXSNL",
+        ["MZSNR"] = "BXSNR",
+        ["MZSFL"] = "BXSFL",
+        ["MZSFR"] = "BXSFR",
+
+        // Mine Ex variants.
+        ["MXTAP"] = "EXTAP",
+        ["MXHLD"] = "EXHLD",
+        ["MXSTR"] = "EXSTR",
+    };
+
+    // Expected total number of string fields (including the record type) for known MA2 note records.
+    // If a line has exactly one more field than expected, that trailing field is treated as speed.
+    private static readonly Dictionary<string, int> KnownMa2FieldCounts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        // Taps
+        ["NMTAP"] = 4,
+        ["BRTAP"] = 4,
+        ["EXTAP"] = 4,
+        ["BXTAP"] = 4,
+        // Holds
+        ["NMHLD"] = 5,
+        ["BRHLD"] = 5,
+        ["EXHLD"] = 5,
+        ["BXHLD"] = 5,
+        // Touch
+        ["NMTTP"] = 7,
+        ["BRTTP"] = 7,
+        ["EXTTP"] = 7,
+        ["BXTTP"] = 7,
+        // Stars
+        ["NMSTR"] = 4,
+        ["BRSTR"] = 4,
+        ["EXSTR"] = 4,
+        ["BXSTR"] = 4,
+        // Slides seen in standard MA2 charts
+        ["NMSI_"] = 7,
+        ["NMSL_"] = 7,
+        ["NMSR_"] = 7,
+        ["NMSU_"] = 7,
+        ["NMSD_"] = 7,
+        ["NMSCL"] = 7,
+        ["NMSCR"] = 7,
+        ["NMSXL"] = 7,
+        ["NMSXR"] = 7,
+        ["NMSUL"] = 7,
+        ["NMSUR"] = 7,
+        ["NMSLL"] = 7,
+        ["NMSLR"] = 7,
+        ["NMSNL"] = 7,
+        ["NMSNR"] = 7,
+        ["NMSFL"] = 7,
+        ["NMSFR"] = 7,
+        ["NMSF_"] = 7,
+        // Custom slide types from this module
+        ["NMSSS"] = 8,
+        ["BRSSS"] = 8,
+        ["EXSSS"] = 8,
+        ["BXSSS"] = 8,
+        ["CNSSS"] = 8,
+    };
+
+    public static void OnAfterPatch()
+    {
+        AllNoteTypeNames.UnionWith(KnownMa2FieldCounts.Keys);
+        AllNoteTypeNames.UnionWith(MineToBaseMap.Keys);
+        AllNoteTypeNames.Add("BRTTP");
+        AllNoteTypeNames.Add("BRTHO");
+        AllNoteTypeNames.Add("MBTTP");
+        AllNoteTypeNames.Add("MBTHO");
+
+        var arrayTraverse = Traverse.Create(typeof(Ma2fileRecordID)).Field("s_Ma2fileRecord_Data");
+        var targetArray = arrayTraverse.GetValue<Array>();
+
+        var nextId = targetArray.Length;
+        List<object[]> newEntries =
+        [
+            [nextId++, "NMSSS", "过新过热Slide", NotesTypeID.Def.Slide, SlideType.Slide_MAX, 8, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "BRSSS", "过新过热BreakSlide", NotesTypeID.Def.BreakSlide, SlideType.Slide_MAX, 8, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "EXSSS", "过新过热ExSlide", NotesTypeID.Def.ExSlide, SlideType.Slide_MAX, 8, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "BXSSS", "过新过热ExBreakSlide", NotesTypeID.Def.ExBreakSlide, SlideType.Slide_MAX, 8, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "CNSSS", "过新过热ConnSlide", NotesTypeID.Def.ConnectSlide, SlideType.Slide_MAX, 8, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+
+            // ========== 地雷键 ==========
+            // 命名规则（2026-08 用户定版）：
+            //   MN = 普通(NM) 的地雷版
+            //   MB = Break(BR) 的地雷版
+            //   MX = Ex(EX) 的地雷版
+            //   MZ = ExBreak(BX) 的地雷版
+            //   BR = 绝赞系（非地雷）：BRTTP = 绝赞 touch、BRTHO = 绝赞 touchhold
+            //   MB = 地雷绝赞：MBTTP = 地雷绝赞 touch、MBTHO = 地雷绝赞 touchhold
+
+            // MN: 普通地雷 (NMTAP->MNTAP, NMHLD->MNHLD, ...)
+            [nextId++, "MNTAP", "地雷Tap", NotesTypeID.Def.Tap, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MNHLD", "地雷Hold", NotesTypeID.Def.Hold, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MNSTR", "地雷Star", NotesTypeID.Def.Star, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MNSSS", "地雷Slide", NotesTypeID.Def.Slide, SlideType.Slide_MAX, 8, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MNTTP", "地雷Touch", NotesTypeID.Def.TouchTap, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MBTTP", "地雷绝赞Touch", NotesTypeID.Def.TouchTap, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MNTHO", "地雷TouchHold", NotesTypeID.Def.TouchHold, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MBTHO", "地雷绝赞TouchHold", NotesTypeID.Def.TouchHold, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+
+            // MB: Break 地雷 (BRTAP->MBTAP, BRHLD->MBHLD, ...)
+            [nextId++, "MBTAP", "地雷BreakTap", NotesTypeID.Def.Tap, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MBHLD", "地雷BreakHold", NotesTypeID.Def.Hold, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MBSTR", "地雷BreakStar", NotesTypeID.Def.Star, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MBSSS", "地雷BreakSlide", NotesTypeID.Def.BreakSlide, SlideType.Slide_MAX, 8, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+
+            // MZ: ExBreak 地雷 (BXTAP->MZTAP, BXHLD->MZHLD, ...)
+            [nextId++, "MZTAP", "地雷ExBreakTap", NotesTypeID.Def.Tap, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MZHLD", "地雷ExBreakHold", NotesTypeID.Def.Hold, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MZSTR", "地雷ExBreakStar", NotesTypeID.Def.Star, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MZSSS", "地雷ExBreakSlide", NotesTypeID.Def.ExBreakSlide, SlideType.Slide_MAX, 8, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+
+            // MX: Ex 地雷 (EXTAP->MXTAP, EXHLD->MXHLD, ...)
+            [nextId++, "MXTAP", "地雷ExTap", NotesTypeID.Def.Tap, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MXHLD", "地雷ExHold", NotesTypeID.Def.Hold, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+            [nextId++, "MXSTR", "地雷ExStar", NotesTypeID.Def.Star, SlideType.Slide_Straight, 0, Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0],
+        ];
+
+        // Register mine variants for all normal (non-break) native slide types.
+        string[] mineSlideBases =
+        [
+            "NMSCR", "NMSCL", "NMSI_", "NMSLL", "NMSLR",
+            "NMSUL", "NMSUR", "NMSXL", "NMSXR", "NMSF_",
+            "NMSV_", "NMSSL", "NMSSR", "NMSL_", "NMSR_",
+            "NMSU_", "NMSD_", "NMSNL", "NMSNR", "NMSFL",
+            "NMSFR",
+        ];
+
+        foreach (var baseName in mineSlideBases)
+        {
+            var mineName = "MN" + baseName.Substring(2);
+            newEntries.Add(
+            [
+                nextId++, mineName, "地雷" + baseName, NotesTypeID.Def.Slide, SlideType.Slide_MAX, 8,
+                Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0,
+            ]);
+        }
+
+        // Register mine variants for Break native slide types.
+        string[] breakSlideBases =
+        [
+            "BRSCR", "BRSCL", "BRSI_", "BRSLL", "BRSLR",
+            "BRSUL", "BRSUR", "BRSXL", "BRSXR", "BRSF_",
+            "BRSV_", "BRSSL", "BRSSR", "BRSL_", "BRSR_",
+            "BRSU_", "BRSD_", "BRSNL", "BRSNR", "BRSFL",
+            "BRSFR",
+        ];
+
+        foreach (var baseName in breakSlideBases)
+        {
+            var mineName = "MB" + baseName.Substring(2);
+            newEntries.Add(
+            [
+                nextId++, mineName, "地雷" + baseName, NotesTypeID.Def.BreakSlide, SlideType.Slide_MAX, 8,
+                Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0,
+            ]);
+        }
+
+        // Register mine variants for ExBreak native slide types.
+        string[] exBreakSlideBases =
+        [
+            "BXSCR", "BXSCL", "BXSI_", "BXSLL", "BXSLR",
+            "BXSUL", "BXSUR", "BXSXL", "BXSXR", "BXSF_",
+            "BXSV_", "BXSSL", "BXSSR", "BXSL_", "BXSR_",
+            "BXSU_", "BXSD_", "BXSNL", "BXSNR", "BXSFL",
+            "BXSFR",
+        ];
+
+        foreach (var baseName in exBreakSlideBases)
+        {
+            var mineName = "MZ" + baseName.Substring(2);
+            newEntries.Add(
+            [
+                nextId++, mineName, "地雷" + baseName, NotesTypeID.Def.ExBreakSlide, SlideType.Slide_MAX, 8,
+                Ma2Category.MA2_Note, 2, 2, 2, 2, 2, 2, 0,
+            ]);
+        }
+
+
+        // Ma2fileRecordID.Ma2fileRecord_Data is private, so we need this shit.
+        var structType = targetArray.GetValue(0).GetType();
+        var constructor = AccessTools.Constructor(structType,
+        [
+            typeof(int), typeof(string), typeof(string), typeof(NotesTypeID.Def), typeof(SlideType), typeof(int),
+            typeof(Ma2Category), typeof(int), typeof(int), typeof(int), typeof(int), typeof(int), typeof(int),
+            typeof(int)
+        ]);
+
+        Ma2FileRecordData = Array.CreateInstance(structType, targetArray.Length + newEntries.Count);
+        for (var i = 0; i < targetArray.Length; i++)
+        {
+            Ma2FileRecordData.SetValue(targetArray.GetValue(i), i);
+        }
+
+        for (var i = 0; i < newEntries.Count; i++)
+        {
+            var j = targetArray.Length + i;
+            var obj = constructor.Invoke(newEntries[i]);
+            Ma2FileRecordData.SetValue(obj, j);
+        }
+
+        arrayTraverse.SetValue(Ma2FileRecordData);
+        TotalMa2RecordCount = Ma2FileRecordData.Length;
+        LastMa2RecordID = TotalMa2RecordCount - 1;
+        MelonLogger.Msg($"[CustomNoteType] MA2 record data extended, total count: {TotalMa2RecordCount}");
+
+        // Initialize related classes ...
+        SlideDataBuilder.InitializeHitAreasLookup();
+        MelonLogger.Msg($"[CustomNoteType] HitAreasLookup initialized, total count: {SlideDataBuilder.HitAreasLookup.Count}");
+
+        LoadMineTextures();
+    }
+
+    private static void LoadMineTextures()
+    {
+        if (_mineTexturesLoaded) return;
+        _mineTexturesLoaded = true;
+
+        var dir = FileSystem.ResolvePath("LocalAssets/CustomNoteTypes");
+        if (!Directory.Exists(dir))
+        {
+            MelonLogger.Warning($"[CustomNoteType] Mine texture directory not found: {dir}");
+            return;
+        }
+
+        foreach (var file in Directory.EnumerateFiles(dir, "*.png", SearchOption.TopDirectoryOnly))
+        {
+            var name = Path.GetFileNameWithoutExtension(file).ToLowerInvariant();
+            var texture = new Texture2D(1, 1, TextureFormat.RGBA32, false);
+            if (texture.LoadImage(File.ReadAllBytes(file)))
+            {
+                MineTextures[name] = texture;
+            }
+        }
+
+        MelonLogger.Msg($"[CustomNoteType] Loaded {MineTextures.Count} mine textures from {dir}");
+    }
+
+    private static bool TryRedirectMineRecord(MA2Record rec)
+    {
+        var name = rec.getType().getEnumName();
+        if (!MineToBaseMap.TryGetValue(name, out var baseName)) return false;
+
+        var baseId = Ma2fileRecordID.findID(baseName);
+        if (baseId == Ma2fileRecordID.Def.Invalid) return false;
+
+        var traverse = Traverse.Create(rec);
+        foreach (var fieldName in new[] { "type", "_type", "m_type", "Type" })
+        {
+            var field = traverse.Field(fieldName);
+            if (field.FieldExists())
+            {
+                field.SetValue(baseId);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryRedirectSpecialRecord(MA2Record rec)
+    {
+        var name = rec.getType().getEnumName();
+        string baseName = null;
+        var isMine = false;
+        var isCriticalTouch = false;
+
+        if (MineToBaseMap.TryGetValue(name, out baseName))
+        {
+            isMine = true;
+        }
+        else if (name == "BRTTP")
+        {
+            // 绝赞 touch：判定同普通 touch，但命中强制 Critical Perfect（非地雷）。
+            baseName = "NMTTP";
+            isCriticalTouch = true;
+        }
+        else if (name == "BRTHO")
+        {
+            // 绝赞 touchhold（非地雷）：命中强制 Critical Perfect。
+            baseName = "NMTHO";
+            isCriticalTouch = true;
+        }
+        else if (name == "MBTTP")
+        {
+            // 地雷绝赞 touch。
+            baseName = "NMTTP";
+            isMine = true;
+            isCriticalTouch = true;
+        }
+        else if (name == "MBTHO")
+        {
+            // 地雷绝赞 touchhold（素材 touchhold_break_0..3 + touchhold_break）。
+            baseName = "NMTHO";
+            isMine = true;
+            isCriticalTouch = true;
+        }
+        else
+        {
+            return false;
+        }
+
+        var baseId = Ma2fileRecordID.findID(baseName);
+        if (baseId == Ma2fileRecordID.Def.Invalid)
+        {
+            MelonLogger.Error($"[CustomNoteType] Redirect failed: cannot find base type {baseName} for {name}");
+            return false;
+        }
+
+        var traverse = Traverse.Create(rec);
+        foreach (var fieldName in new[] { "type", "_type", "m_type", "Type" })
+        {
+            var field = traverse.Field(fieldName);
+            if (field.FieldExists())
+            {
+                field.SetValue(baseId);
+                _pendingMineForCurrentLoad = isMine;
+                _pendingCriticalTouchForCurrentLoad = isCriticalTouch;
+                return true;
+            }
+        }
+
+        MelonLogger.Error($"[CustomNoteType] Redirect failed: cannot find type field on MA2Record for {name}");
+        return false;
+    }
+
+
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(Ma2fileRecordID), "findID")]
+    public static bool FindIDPrefix(string enumName, ref Ma2fileRecordID.Def __result)
+    {
+        // NOTE: Do NOT reset _pendingMineForCurrentLoad / _pendingCriticalTouchForCurrentLoad here.
+        // findID can be called multiple times before loadNote; resetting here would lose the flag.
+
+        string baseName = null;
+        var isMine = false;
+        var isCriticalTouch = false;
+
+        if (MineToBaseMap.TryGetValue(enumName, out baseName))
+        {
+            isMine = true;
+        }
+        else if (enumName == "BRTTP")
+        {
+            // 绝赞 touch（非地雷，命中强制 CP）。
+            baseName = "NMTTP";
+            isCriticalTouch = true;
+        }
+        else if (enumName == "BRTHO")
+        {
+            // 绝赞 touchhold（非地雷，命中强制 CP）。
+            baseName = "NMTHO";
+            isCriticalTouch = true;
+        }
+        else if (enumName == "MBTTP")
+        {
+            // 地雷绝赞 touch。
+            baseName = "NMTTP";
+            isMine = true;
+            isCriticalTouch = true;
+        }
+        else if (enumName == "MBTHO")
+        {
+            // 地雷绝赞 touchhold。
+            baseName = "NMTHO";
+            isMine = true;
+            isCriticalTouch = true;
+        }
+
+        if (baseName != null)
+        {
+            for (var i = 0; i < TotalMa2RecordCount; i++)
+            {
+                var item = Ma2FileRecordData.GetValue(i);
+                if (Traverse.Create(item).Field<string>("enumName").Value == baseName)
+                {
+                    __result = (Ma2fileRecordID.Def)i;
+                    if (AllNoteTypeNames.Contains(enumName))
+                    {
+                        PendingMineFlags.Enqueue(isMine);
+                        PendingCriticalFlags.Enqueue(isCriticalTouch);
+                    }
+                    return false;
+                }
+            }
+
+            MelonLogger.Error($"[CustomNoteType] findID cannot find base type {baseName} for {enumName}");
+            return false;
+        }
+
+        // Normal lookup (including custom slide types like NMSSS).
+        __result = Ma2fileRecordID.Def.Invalid;
+        for (var i = 0; i < TotalMa2RecordCount; i++)
+        {
+            var item = Ma2FileRecordData.GetValue(i);
+            if (Traverse.Create(item).Field<string>("enumName").Value == enumName)
+            {
+                __result = (Ma2fileRecordID.Def)i;
+            }
+        }
+
+        if (AllNoteTypeNames.Contains(enumName))
+        {
+            PendingMineFlags.Enqueue(false);
+            PendingCriticalFlags.Enqueue(false);
+        }
+
+        return false;
+    }
+
+    [HarmonyPatch]
+    public static class Ma2RecordValidation
+    {
+        public static IEnumerable<MethodBase> TargetMethods()
+        {
+            return
+            [
+                // AccessTools.Method(typeof(Ma2fileRecordID), "findID"),
+                AccessTools.Method(typeof(Ma2fileRecordID), "clamp"),
+                AccessTools.Method(typeof(Ma2fileRecordID), "getClampValue"),
+                AccessTools.Method(typeof(Ma2fileRecordID), "isValid"),
+                AccessTools.Method(typeof(Ma2fileRecordID_Extension), "isValid"),
+            ];
+        }
+
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+
+            foreach (var inst in instructions)
+            {
+                if (inst.LoadsConstant(142))
+                {
+                    var instNew = new CodeInstruction(OpCodes.Ldsfld, AccessTools.Field(typeof(CustomNoteTypes), "TotalMa2RecordCount"));
+                    yield return instNew;
+                }
+                else if (inst.LoadsConstant(141))
+                {
+                    var instNew = new CodeInstruction(OpCodes.Ldsfld, AccessTools.Field(typeof(CustomNoteTypes), "LastMa2RecordID"));
+                    yield return instNew;
+                }
+                else
+                {
+                    yield return inst;
+                }
+            }
+        }
+    }
+
+    /*
+     * ========== ========== ========== ========== ========== ========== ========== ==========
+     * 以下内容是给新的 MA2 语法写解析器
+     */
+
+    /*
+     * 给新建的 noteData 初始化应有的数据, 仅仅是照搬了 NotesReader.loadNote
+     */
+    public static void PrepareBasicNoteData(NoteData noteData, NotesReader reader,
+        MA2Record record, int index, ref int noteIndex, OptionMirrorID mirrorMode)
+    {
+        noteData.type = new NotesTypeID(record.getType().getNotesTypeId());
+        noteData.time.init(record.getBar(), record.getGrid(), reader);
+        noteData.end = noteData.time;
+        noteData.startButtonPos = MaiGeometry.MirrorInfo[(int)mirrorMode, record.getPos()];
+        noteData.index = index;
+        var num = record.getGrid() % 96;
+        if (num == 0)
+        {
+            noteData.beatType = NoteData.BeatType.BeatType04;
+        }
+        else if (num % 48 == 0)
+        {
+            noteData.beatType = NoteData.BeatType.BeatType08;
+        }
+        else if (num % 24 == 0)
+        {
+            noteData.beatType = NoteData.BeatType.BeatType16;
+        }
+        else if (num % 16 == 0)
+        {
+            noteData.beatType = NoteData.BeatType.BeatType24;
+        }
+        else
+        {
+            noteData.beatType = NoteData.BeatType.BeatTypeOther;
+        }
+        noteData.indexNote = noteIndex;
+        ++noteIndex;
+    }
+
+    /*
+     * 给新建的 noteData 填入基本的 slide 相关数据, 仅仅是照搬了 NotesReader.loadNote
+     */
+    public static void PrepareBasicSlideData(NoteData noteData, NotesReader reader, MA2Record record, int noteIndex,
+        ref int slideIndex, OptionMirrorID mirrorMode)
+    {
+        noteData.indexSlide = slideIndex++;
+        var slideData = noteData.slideData;
+        var slideWaitLen = record.getSlideWaitLen();
+        var slideShootLen = record.getSlideShootLen();
+        slideData.targetNote = MaiGeometry.MirrorInfo[(int)mirrorMode, record.getSlideEndPos()];
+        slideData.shoot.time.init(record.getBar(), record.getGrid() + slideWaitLen, reader);
+        slideData.shoot.index = noteIndex;
+        slideData.arrive.time.init(record.getBar(), record.getGrid() + slideWaitLen + slideShootLen, reader);
+        slideData.arrive.index = noteIndex;
+        noteData.end = slideData.arrive.time;
+    }
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(NotesReader), "loadNote")]
+    public static bool LoadCustomNote(NotesReader __instance, ref bool __result, NotesData ____note, int ____playerID,
+        MA2Record rec, int index, ref int noteIndex, ref int slideIndex)
+    {
+        _noteCountBeforeLoad = ____note?._noteData?.Count ?? 0;
+        _optionalSpeedForCurrentLoad = null;
+        _removedOptionalSpeedString = null;
+        _optionalSpeedRemoved = false;
+
+        // Note: mine/critical flags are set in FindIDPrefix before loadNote is called.
+        // Do NOT reset them here, otherwise the mine marking would be lost.
+
+        if (TryPeekSpeedValue(rec, out var optionalSpeed) || TryGetOptionalSpeed(rec, out optionalSpeed))
+        {
+            _optionalSpeedForCurrentLoad = optionalSpeed;
+
+            // For built-in records, temporarily remove the extra speed field so the original
+            // MA2 parser still sees the normal number of fields.
+            if (rec.getType() < Ma2fileRecordID.Def.End)
+            {
+                _removedOptionalSpeedString = rec.getStr((uint)(rec._str.Count - 1));
+                rec._str.RemoveAt(rec._str.Count - 1);
+                _optionalSpeedRemoved = true;
+            }
+        }
+
+        if (rec.getType() < Ma2fileRecordID.Def.End)
+        {
+            // builtin record type
+            return true;
+        }
+
+        var flag = true;
+        switch (rec.getType().getEnumName())
+        {
+            case "NMSSS":
+            case "BRSSS":
+            case "EXSSS":
+            case "BXSSS":
+            case "CNSSS":
+                var noteData = new CustomSlideNoteData();
+                var mirrorMode = Singleton<GamePlayManager>.Instance.GetGameScore(____playerID).UserOption.MirrorMode;
+                PrepareBasicNoteData(noteData, __instance, rec, index, ref noteIndex, mirrorMode);
+                PrepareBasicSlideData(noteData, __instance, rec, noteIndex, ref slideIndex, mirrorMode);
+                var success = noteData.ParseSlideCode(rec.getStr(7), mirrorMode);
+                if (success)
+                {
+                    ____note._noteData.Add(noteData);
+                    _currentNoteData = noteData;
+
+                    // Optional per-note speed on custom slides:
+                    // NMSSS/... [slide code] [speed], e.g. ... "x0.5" or "-1"
+                    if (rec._str.Count > 8 && TryParseSpeedMultiplier(rec.getStr(8), out var noteSpeed))
+                    {
+                        NoteSpeedMultipliers[noteData] = noteSpeed;
+                        NoteSpeedByIndex[noteData.indexNote] = noteSpeed;
+                        TrySetNoteSpeedField(noteData, noteSpeed);
+                    }
+                }
+                else
+                {
+                    flag = false;
+                }
+                break;
+            default:
+                flag = false;
+                break;
+        }
+        __result = flag;
+        return false;
+    }
+
+    private static bool TryParseSpeedMultiplier(string text, out float speed)
+    {
+        speed = 1f;
+        if (string.IsNullOrEmpty(text)) return false;
+
+        text = text.Trim();
+        if (text.StartsWith("x") || text.StartsWith("X"))
+        {
+            text = text.Substring(1);
+        }
+
+        return float.TryParse(text, System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out speed);
+    }
+
+    private static bool TryPeekSpeedValue(MA2Record rec, out float speed)
+    {
+        speed = 1f;
+        if (rec._str.Count == 0) return false;
+        var last = rec.getStr((uint)(rec._str.Count - 1))?.Trim();
+        if (string.IsNullOrEmpty(last)) return false;
+        if (!last.StartsWith("x") && !last.StartsWith("X") && !last.StartsWith("-") && !last.Contains(".")) return false;
+        return TryParseSpeedMultiplier(last, out speed);
+    }
+
+    private static bool TryGetOptionalSpeed(MA2Record rec, out float speed)
+    {
+        speed = 1f;
+        var typeName = rec.getType().getEnumName();
+
+        if (KnownMa2FieldCounts.TryGetValue(typeName, out var expectedCount))
+        {
+            if (rec._str.Count == expectedCount + 1)
+            {
+                return TryParseSpeedMultiplier(rec.getStr((uint)(rec._str.Count - 1)), out speed);
+            }
+            // If the count doesn't match, fall through to the heuristic below.
+            // This handles cases where the MA2 parser's field counting is different from our table.
+        }
+
+        // Conservative heuristic: if the last field looks like an explicit speed value
+        // (x0.5, -1, 0.8, 1.2, ...), treat it as the optional speed field.
+        // Normal MA2 note fields are integers, so this should not misread normal notes.
+        return TryPeekSpeedValue(rec, out speed);
+    }
+
+    private static bool TrySetNoteSpeedField(NoteData note, float speed)
+    {
+        if (note == null) return false;
+
+        var type = note.GetType();
+        foreach (var name in new[] { "speed", "noteSpeed", "Speed", "NoteSpeed", "mSpeed" })
+        {
+            var field = AccessTools.Field(type, name);
+            if (field != null && field.FieldType == typeof(float))
+            {
+                field.SetValue(note, speed);
+                return true;
+            }
+
+            var property = AccessTools.Property(type, name);
+            if (property != null && property.PropertyType == typeof(float) && property.CanWrite)
+            {
+                property.SetValue(note, speed);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static void ApplyNoteSpeedMultiplier(ref float speed, Queue<float> pendingQueue)
+    {
+        if (_currentNoteData != null)
+        {
+            float multiplier;
+            if (NoteSpeedMultipliers.TryGetValue(_currentNoteData, out multiplier) ||
+                NoteSpeedByIndex.TryGetValue(_currentNoteData.indexNote, out multiplier))
+            {
+                multiplier = SanitizeSpeedMultiplier(multiplier);
+                speed *= multiplier;
+                // Keep the fallback queue in sync even when context works.
+                if (pendingQueue.Count > 0) pendingQueue.Dequeue();
+                return;
+            }
+        }
+
+        // Fallback: if we can't correlate the current NoteData, assume GetNoteSpeed/GetTouchSpeed
+        // is called once per note in the same order the notes were loaded.
+        if (pendingQueue.Count > 0)
+        {
+            var queued = SanitizeSpeedMultiplier(pendingQueue.Dequeue());
+            speed *= queued;
+        }
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(NotesReader), "loadNote")]
+    public static void ApplyOptionalHyperSpeed(NotesData ____note, MA2Record rec, bool __result)
+    {
+        // Put back the temporary removed speed field, if any.
+        if (_optionalSpeedRemoved && _removedOptionalSpeedString != null)
+        {
+            rec._str.Add(_removedOptionalSpeedString);
+            _optionalSpeedRemoved = false;
+            _removedOptionalSpeedString = null;
+        }
+
+        if (!__result) return;
+
+        var list = ____note?._noteData;
+        if (list == null || list.Count <= _noteCountBeforeLoad) return;
+
+        var note = list[list.Count - 1];
+        _currentNoteData = note;
+
+        // Pull the mine/critical flags for this note from the findID queue.
+        if (PendingMineFlags.Count > 0)
+        {
+            _pendingMineForCurrentLoad = PendingMineFlags.Dequeue();
+            _pendingCriticalTouchForCurrentLoad = PendingCriticalFlags.Dequeue();
+        }
+
+        var kind = CustomNoteKind.None;
+        if (_pendingMineForCurrentLoad)
+        {
+            kind = CustomNoteKind.Mine;
+            _pendingMineForCurrentLoad = false;
+        }
+
+        if (_pendingCriticalTouchForCurrentLoad)
+        {
+            kind = kind == CustomNoteKind.Mine ? CustomNoteKind.MineCriticalTouch : CustomNoteKind.CriticalTouch;
+            _pendingCriticalTouchForCurrentLoad = false;
+        }
+
+        if (kind != CustomNoteKind.None)
+        {
+            NoteKinds[note.indexNote] = kind;
+        }
+
+        float speedToUse = 1f;
+        if (_optionalSpeedForCurrentLoad.HasValue)
+        {
+            speedToUse = _optionalSpeedForCurrentLoad.Value;
+            NoteSpeedMultipliers[note] = speedToUse;
+            NoteSpeedByIndex[note.indexNote] = speedToUse;
+            TrySetNoteSpeedField(note, speedToUse);
+        }
+
+        // Keep the fallback queues aligned with every loaded note.
+        PendingNoteSpeedMultipliers.Enqueue(speedToUse);
+        PendingTouchSpeedMultipliers.Enqueue(speedToUse);
+        _optionalSpeedForCurrentLoad = null;
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(GameManager), "GetNoteSpeed")]
+    public static void GetNoteSpeedPostfix(ref float __result)
+    {
+        ApplyNoteSpeedMultiplier(ref __result, PendingNoteSpeedMultipliers);
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(GameManager), "GetTouchSpeed")]
+    public static void GetTouchSpeedPostfix(ref float __result)
+    {
+        ApplyNoteSpeedMultiplier(ref __result, PendingTouchSpeedMultipliers);
+    }
+
+    /*
+     * ========== ========== ========== ========== ========== ========== ========== ==========
+     * SV（全局变速，走原版 note speed 流速系统）
+     *
+     * ma2 语法（用户 2026-08 定版）：
+     *   SVSP\t<bar>\t<grid>\t<倍率>   从该时刻起全局下落速度倍率（持续到下一行 SVSP 或谱面结束）
+     *   SVSP\t<bar>\t<grid>\tNULL     恢复原速 1.0
+     * 游戏 parser 对未知标签行自动跳过（MA2Record.init 返回 false），mod 用 addRecord(String)
+     * 前缀拦截原始行收集段；loadMa2Main 后置把 (bar,grid,倍率) 转 msec 存入 SvSegments。
+     *
+     * 实现（用户 2026-08 定版，弃用早期的时间重映射方案 #32/#33/#34）：
+     * 原版 note speed 选项（1.0~10.0）的机制是 DefaultMsec = GetNoteSpeedForBeat(流速)×4，
+     * 位置公式（GetNoteYPosition）与出现缩放（NoteCheck 的 scale 0→1）共用 DefaultMsec，
+     * 天然同步 = 原版流速观感。SV 就是"每音符等效流速"：音符 Initialize 完成后，
+     * 按音符判定时刻的 SV 倍率 m 缩放 DefaultMsec（D' = D/m，StartMsec 同步），
+     * 等效流速 = 玩家流速 × m（如玩家 7.25、SV x0.5 → 7.25×0.5 = 3.625）。
+     * 位置/缩放/引导环全部由原版公式处理，判定路径（IsNoteCheckTimeStart 等）只读
+     * AppearMsec（音频时刻），完全不受 DefaultMsec 影响——判定保持对得上音乐。
+     * 与 HS（每音符 speed 尾字段，走 GetNoteSpeed/GetTouchSpeed postfix）正交共存：
+     * 两者都落在 DefaultMsec 里（HS 在 Initialize 内缩放、SV 在 Initialize 后再缩一次）。
+     *
+     * 激活时机（bug #35 教训）：音符不是加载时全部激活——GameCtrl.UpdateCtrl 每帧按
+     * now >= noteTime − apperMsecTap/Touch 从对象池取出注册（apperMsecTap = 2×DefaultMsec、
+     * apperMsecTouch = 1.25×DefaultMsec，即渐入窗口起点）。SV 缩放 DefaultMsec 后必须把
+     * 激活提前量同样按 m 缩放（SvActivationLeadTranspiler），否则低流速段音符激活太晚、
+     * 渐入窗口在激活前就结束，表现为"没有渐入直接下落"。
+     *
+     * 注：每音符一个恒定等效流速——飞行中途的多段变速 / SV=0 冻结暂不支持
+     * （需每帧改写 DefaultMsec 会破坏原版相位结构，后续如需再加）。
+     * ========== ========== ========== ========== ========== ========== ========== ==========
+     */
+    private static readonly List<(int Bar, int Grid, float Multiplier)> PendingSvSegments = new List<(int, int, float)>();
+    // 已转换的 SV 段（msec, 倍率），按 msec 升序。
+    private static readonly List<(float Msec, float Multiplier)> SvSegments = new List<(float, float)>();
+    // 每音符预计算的 SV 倍率（indexNote → m）。UpdateCtrl 每帧对未注册音符查询激活提前量，
+    // 直接查字典避免每帧遍历段表（否则低流速测试时游戏会卡）。
+    private static readonly Dictionary<int, float> SvMultiplierByNoteIndex = new Dictionary<int, float>();
+    private static bool _loggedSvInject;
+    private static bool _loggedSvLeadScale;
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(NotesRecord), "addRecord", new[] { typeof(string) })]
+    public static void AddRecordSvParsePrefix(string str)
+    {
+        // 拦截每行 ma2 原文，解析 SVSP 行（原方法参数名是 str，Harmony 按名匹配）。
+        if (string.IsNullOrEmpty(str) || !str.StartsWith("SVSP", StringComparison.OrdinalIgnoreCase)) return;
+        try
+        {
+            var parts = str.Split('\t');
+            if (parts.Length < 4) return;
+            if (!int.TryParse(parts[1].Trim(), out var bar)) return;
+            if (!int.TryParse(parts[2].Trim(), out var grid)) return;
+            var valueText = parts[3].Trim();
+            if (valueText.Equals("NULL", StringComparison.OrdinalIgnoreCase))
+            {
+                PendingSvSegments.Add((bar, grid, 1f));
+                return;
+            }
+
+            if (float.TryParse(valueText, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out var multiplier))
+            {
+                PendingSvSegments.Add((bar, grid, multiplier));
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(NotesReader), "loadMa2")]
+    public static void LoadMa2SvResetPrefix()
+    {
+        PendingSvSegments.Clear();
+        SvSegments.Clear();
+        SvMultiplierByNoteIndex.Clear();
+        _loggedSvInject = false;
+        _loggedSvLeadScale = false;
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(NotesReader), "loadMa2Main")]
+    public static void LoadMa2MainSvInjectPostfix(NotesReader __instance)
+    {
+        try
+        {
+            if (PendingSvSegments.Count == 0) return;
+
+            // bar/grid → msec（loadMa2Main 结束时 BPM/MET 表已就绪，NotesTime.init 可转换）。
+            var entries = new List<(float Msec, float Multiplier)>();
+            foreach (var seg in PendingSvSegments)
+            {
+                var time = new NotesTime();
+                time.init(seg.Bar, seg.Grid, __instance);
+                entries.Add((time.msec, seg.Multiplier));
+            }
+
+            entries.Sort((a, b) => a.Msec.CompareTo(b.Msec));
+
+            // 同刻去重（保留最后值）。
+            SvSegments.Clear();
+            foreach (var entry in entries)
+            {
+                if (SvSegments.Count > 0 && System.Math.Abs(SvSegments[SvSegments.Count - 1].Msec - entry.Msec) < 0.5f)
+                {
+                    SvSegments[SvSegments.Count - 1] = entry;
+                }
+                else
+                {
+                    SvSegments.Add(entry);
+                }
+            }
+
+            if (!_loggedSvInject)
+            {
+                _loggedSvInject = true;
+                MelonLogger.Msg($"[CustomNoteType] SV active: {SvSegments.Count} segments (first msec={SvSegments[0].Msec:F0} x{SvSegments[0].Multiplier:F2})");
+            }
+
+            // 预构建每音符 SV 倍率表（激活提前量查询用，避免每帧遍历段表）。
+            try
+            {
+                var noteList = __instance.GetNoteList();
+                if (noteList != null)
+                {
+                    SvMultiplierByNoteIndex.Clear();
+                    foreach (var note in noteList)
+                    {
+                        if (note == null) continue;
+                        SvMultiplierByNoteIndex[note.indexNote] = GetSvMultiplierAt(note.time.msec);
+                    }
+
+                    MelonLogger.Msg($"[CustomNoteType] SV note table built: {SvMultiplierByNoteIndex.Count} notes");
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"[CustomNoteType] SV note table failed: {ex.Message}");
+            }
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CustomNoteType] SV setup failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>查询 msec 时刻生效的 SV 倍率（按段表，未到第一段前为 1.0）。</summary>
+    private static float GetSvMultiplierAt(float msec)
+    {
+        var m = 1f;
+        for (var i = 0; i < SvSegments.Count; i++)
+        {
+            if (msec >= SvSegments[i].Msec) m = SvSegments[i].Multiplier;
+            else break;
+        }
+
+        return m;
+    }
+
+    /// <summary>按判定时刻的 SV 倍率缩放音符 DefaultMsec/StartMsec（等效流速 = 玩家流速 × m）。
+    /// 挂 NoteBase.Initialize 后置（各子类 Initialize 都调 base，此 patch 一次覆盖
+    /// Tap/Hold/Break/Star/Touch 等全部音符类型）。</summary>
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(NoteBase), "Initialize")]
+    public static void SvApplyNoteSpeedOnInit(NoteBase __instance)
+    {
+        if (SvSegments.Count == 0) return;
+        try
+        {
+            var tr = Traverse.Create(__instance);
+            var appear = tr.Field("AppearMsec").GetValue<float>();
+            var m = GetSvMultiplierAt(appear);
+            if (System.Math.Abs(m - 1f) < 0.001f) return;
+
+            var d = tr.Field("DefaultMsec").GetValue<float>();
+            var newD = d / m;
+            tr.Field("DefaultMsec").SetValue(newD);
+            tr.Field("StartMsec").SetValue(appear - 2f * newD);
+        }
+        catch
+        {
+        }
+    }
+
+    /// <summary>TouchNoteB 在 base.Initialize 之后自己重写 DefaultMsec/StartMsec
+    /// （DefaultMsec = GetTouchSpeedForBeat(GetTouchSpeed())×4——原版有独立的 touch 流速选项；
+    /// StartMsec = AppearMsec − DefaultMsec − GetTouchDispTimes()，淡入窗口 = D×0.25）。
+    /// 需要再挂一次后置把 SV 倍率叠上去，且 StartMsec 必须按 touch 原版公式同步
+    /// （T − D' − D'/4，不是普通音符的 T − 2D'）。</summary>
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(TouchNoteB), "Initialize")]
+    public static void SvApplyNoteSpeedOnTouchInit(TouchNoteB __instance)
+    {
+        if (SvSegments.Count == 0) return;
+        try
+        {
+            var tr = Traverse.Create(__instance);
+            var appear = tr.Field("AppearMsec").GetValue<float>();
+            var m = GetSvMultiplierAt(appear);
+            if (System.Math.Abs(m - 1f) < 0.001f) return;
+
+            var d = tr.Field("DefaultMsec").GetValue<float>();
+            var newD = d / m;
+            tr.Field("DefaultMsec").SetValue(newD);
+            // touch 原版公式：StartMsec = AppearMsec − DefaultMsec − GetTouchDispTimes()，
+            // GetTouchDispTimes() = DefaultMsec×0.25（淡入窗口）。方法不可访问，用公式直算。
+            tr.Field("StartMsec").SetValue(appear - newD - newD * 0.25f);
+        }
+        catch
+        {
+        }
+    }
+
+    /// <summary>按音符判定时刻的 SV 倍率缩放“激活提前量”。
+    /// 原版音符不是加载时全部激活：GameCtrl.UpdateCtrl 每帧检查
+    /// now &gt;= noteTime − apperMsecTap/Touch（apperMsecTap = 2×DefaultMsec、
+    /// apperMsecTouch = 1.25×DefaultMsec）才从对象池取出注册（Initialize + SetActive）。
+    /// 激活时刻 = 渐入/淡入窗口起点（原版 scale 0→1 从这里开始）。
+    /// SV 缩放 DefaultMsec 后若不缩放激活提前量，低流速段（D' = D/m 变大）音符会激活得太晚
+    /// ——渐入窗口在激活前就已结束 → “没有渐入直接下落”。缩放后激活时刻 = T − 2D'（tap）
+    /// / T − 1.25D'（touch），与渐入/淡入窗口起点精确对齐。</summary>
+    private static float SvScaleActivationLead(float lead, NoteData note)
+    {
+        if (SvSegments.Count == 0 || note == null) return lead;
+        try
+        {
+            float m;
+            if (!SvMultiplierByNoteIndex.TryGetValue(note.indexNote, out m))
+            {
+                m = GetSvMultiplierAt(note.time.msec);
+            }
+
+            if (System.Math.Abs(m - 1f) < 0.001f) return lead;
+            if (!_loggedSvLeadScale)
+            {
+                _loggedSvLeadScale = true;
+                MelonLogger.Msg($"[CustomNoteType] SV lead scaled: {lead:F0} -> {lead / m:F0} (m={m:F2})");
+            }
+
+            return lead / m;
+        }
+        catch (Exception ex)
+        {
+            if (!_loggedSvLeadScale)
+            {
+                _loggedSvLeadScale = true;
+                MelonLogger.Msg($"[CustomNoteType] SV lead helper failed: {ex.Message}");
+            }
+
+            return lead;
+        }
+    }
+
+    /// <summary>把 UpdateCtrl 里 apperMsecTap/apperMsecTouch 的读取替换为
+    /// SvScaleActivationLead(apperMsec, 当前NoteData)——激活提前量随 SV 缩放。</summary>
+    [HarmonyPatch]
+    public static class SvActivationLeadTranspiler
+    {
+        public static IEnumerable<MethodBase> TargetMethods()
+        {
+            return [AccessTools.Method(typeof(GameCtrl), "UpdateCtrl")];
+        }
+
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            var helper = AccessTools.Method(typeof(CustomNoteTypes), nameof(SvScaleActivationLead));
+            var list = instructions.ToList();
+
+            // 找循环里保存当前 NoteData 的局部变量（V_11，类型 Manager.NoteData）。
+            Mono.Cecil.Cil.VariableDefinition noteVar = null;
+            foreach (var inst in list)
+            {
+                if ((inst.opcode == OpCodes.Ldloc_S || inst.opcode == OpCodes.Ldloc
+                     || inst.opcode == OpCodes.Stloc_S || inst.opcode == OpCodes.Stloc)
+                    && inst.operand is Mono.Cecil.Cil.VariableDefinition vd
+                    && vd.VariableType.FullName == "Manager.NoteData")
+                {
+                    noteVar = vd;
+                    break;
+                }
+            }
+
+            if (noteVar == null)
+            {
+                foreach (var inst in list) yield return inst;
+                yield break;
+            }
+
+            foreach (var inst in list)
+            {
+                var isLeadField = inst.opcode == OpCodes.Ldfld
+                    && inst.operand is FieldInfo fi
+                    && (fi.Name == "apperMsecTap" || fi.Name == "apperMsecTouch");
+                if (isLeadField)
+                {
+                    yield return inst;                                        // ldfld apperMsec*
+                    yield return new CodeInstruction(OpCodes.Ldloc_S, noteVar); // ldloc.s noteData
+                    yield return new CodeInstruction(OpCodes.Call, helper);   // call SvScaleActivationLead
+                    continue;
+                }
+
+                yield return inst;
+            }
+        }
+    }
+
+    /*
+     * ========== ========== ========== ========== ========== ========== ========== ==========
+     * Bounce（弹跳音符，MajdataViewAlpha BOUNCE 命令移植）
+     *
+     * ma2 语法（仿 SVSP 风格）：
+     *   BOUNCE\t<bar>\t<grid>\t<时长>   从该时刻起，Tap/Star/Hold/Break/Ex 音符
+     *                                    在判定前 <时长> 内从判定线弹到生成半径再弹回判定线
+     *   BOUNCE\t<bar>\t<grid>\tNULL     恢复普通下落
+     * 时长格式（与 Majdata 一致）：秒数（0.5）或 N:M（N 分音符 M 连音，按该时刻 BPM 换算）。
+     *
+     * 实现（移植 MajdataViewAlpha NoteDrop.GetBounceDistance / TapBase.Update）：
+     *   judgeOffset = now - AppearMsec（ms），弹跳窗口 [-B, 0)
+     *   elapsed = clamp(judgeOffset + B, 0, B)；half = B/2
+     *   a = 8×(4.8 - 1.225)/B²；fromApex = elapsed - half
+     *   distance = 1.225 + 0.5×a×fromApex²   （4.8=判定线，1.225=生成半径，抛物线往返）
+     *   映射到游戏坐标：t = (distance - 1.225)/(4.8 - 1.225)，
+     *   y = StartPos + (EndPos - StartPos)×t（t=1 判定线，t=0 生成点）
+     * 弹跳窗口前音符隐藏（alpha=0，对应 Majdata 的 forceRenderingOff）；
+     * 判定路径完全不 patch——弹跳回到判定线的时刻 = 音频判定时刻，判定不受影响。
+     * 与 SV（等效流速）、HS 正交：bounce 用原始时间驱动。
+     * ========== ========== ========== ========== ========== ========== ========== ==========
+     */
+    private const float BounceSpawnRadius = 1.225f;
+    private const float BounceJudgeLine = 4.8f;
+    private static readonly List<(int Bar, int Grid, string Text)> PendingBounceSegments = new List<(int, int, string)>();
+    // 已转换的 Bounce 段（msec, 时长秒），按 msec 升序。
+    private static readonly List<(float Msec, float DurationSec)> BounceSegments = new List<(float, float)>();
+    // 每音符预计算的 bounce 时长（indexNote → 秒，0=无 bounce）。
+    private static readonly Dictionary<int, float> BounceDurationByNoteIndex = new Dictionary<int, float>();
+    private static bool _loggedBounce;
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(NotesRecord), "addRecord", new[] { typeof(string) })]
+    public static void AddRecordBounceParsePrefix(string str)
+    {
+        if (string.IsNullOrEmpty(str) || !str.StartsWith("BOUNCE", StringComparison.OrdinalIgnoreCase)) return;
+        try
+        {
+            var parts = str.Split('\t');
+            if (parts.Length < 4) return;
+            if (!int.TryParse(parts[1].Trim(), out var bar)) return;
+            if (!int.TryParse(parts[2].Trim(), out var grid)) return;
+            PendingBounceSegments.Add((bar, grid, parts[3].Trim()));
+        }
+        catch
+        {
+        }
+    }
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(NotesReader), "loadMa2")]
+    public static void LoadMa2BounceResetPrefix()
+    {
+        PendingBounceSegments.Clear();
+        BounceSegments.Clear();
+        BounceDurationByNoteIndex.Clear();
+        _loggedBounce = false;
+    }
+
+    /// <summary>解析 bounce 时长：秒数或 N:M（N 分音符 M 连音，按 bpm 换算）。</summary>
+    private static float ParseBounceDuration(string text, float bpm)
+    {
+        text = text.Trim();
+        if (string.IsNullOrEmpty(text)) return 0f;
+        if (float.TryParse(text, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var seconds))
+            return seconds;
+        var parts = text.Split(':');
+        if (parts.Length == 2
+            && int.TryParse(parts[0], out var division)
+            && int.TryParse(parts[1], out var count)
+            && division > 0 && count >= 0 && bpm > 0f)
+            return 60f / bpm * 4f / division * count;
+        return 0f;
+    }
+
+    /// <summary>查询 msec 时刻生效的 bounce 时长（秒，0=无 bounce）。</summary>
+    private static float GetBounceDurationAt(float msec)
+    {
+        var d = 0f;
+        for (var i = 0; i < BounceSegments.Count; i++)
+        {
+            if (msec >= BounceSegments[i].Msec) d = BounceSegments[i].DurationSec;
+            else break;
+        }
+
+        return d;
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(NotesReader), "loadMa2Main")]
+    public static void LoadMa2MainBounceInjectPostfix(NotesReader __instance)
+    {
+        try
+        {
+            if (PendingBounceSegments.Count == 0) return;
+
+            var entries = new List<(float Msec, float DurationSec)>();
+            foreach (var seg in PendingBounceSegments)
+            {
+                var time = new NotesTime();
+                time.init(seg.Bar, seg.Grid, __instance);
+                var msec = time.msec;
+                var duration = ParseBounceDuration(seg.Text, __instance.GetBPM_Time(msec));
+                if (duration > 0f) entries.Add((msec, duration));
+            }
+
+            entries.Sort((a, b) => a.Msec.CompareTo(b.Msec));
+
+            BounceSegments.Clear();
+            foreach (var entry in entries)
+            {
+                if (BounceSegments.Count > 0 && System.Math.Abs(BounceSegments[BounceSegments.Count - 1].Msec - entry.Msec) < 0.5f)
+                {
+                    BounceSegments[BounceSegments.Count - 1] = entry;
+                }
+                else
+                {
+                    BounceSegments.Add(entry);
+                }
+            }
+
+            // 预构建每音符 bounce 时长表。
+            try
+            {
+                var noteList = __instance.GetNoteList();
+                if (noteList != null)
+                {
+                    BounceDurationByNoteIndex.Clear();
+                    foreach (var note in noteList)
+                    {
+                        if (note == null) continue;
+                        BounceDurationByNoteIndex[note.indexNote] = GetBounceDurationAt(note.time.msec);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"[CustomNoteType] Bounce note table failed: {ex.Message}");
+            }
+
+            if (!_loggedBounce)
+            {
+                _loggedBounce = true;
+                MelonLogger.Msg($"[CustomNoteType] Bounce active: {BounceSegments.Count} segments (first msec={BounceSegments[0].Msec:F0} dur={BounceSegments[0].DurationSec:F2}s)");
+            }
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CustomNoteType] Bounce setup failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>弹跳视觉：GetNoteYPosition 后置改写音符位置（基类，Tap/Star/Hold/Break 全覆盖）。
+    /// __result 返回弹跳 y（HoldNote.Execute 用返回值算 body 长度/中点，不能改 0）。
+    /// 外框（NoteGuide 弧形引导环）：按【原版运动轨迹 + 弹跳位移】处理——贴图/缩放/朝向
+    /// 全部保持原版逻辑，只在其原版 local 位置上叠加 delta（= 弹跳位置 − 原版位置），
+    /// 与音符的相对关系与原版任意时刻一致（原版判定线处对齐 → 弹跳中自然对齐）。
+    /// 光效/绝赞挂到 NoteObj 下跟随（ReparentBounceEffects）。
+    /// 弹跳窗口前：音符本体隐藏（alpha=0，对应 Majdata forceRenderingOff）；
+    /// 判定后：外框位移归零（原版），恢复可见。</summary>
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(NoteBase), "GetNoteYPosition")]
+    public static void BounceNoteVisualPostfix(NoteBase __instance, ref float __result)
+    {
+        if (BounceSegments.Count == 0 || __instance == null) return;
+        // TouchHoldC 用基类 GetNoteYPosition，但 bounce 只适配 Tap/Star/Hold/Break
+        // （Majdata 的 BOUNCE 类型不含 touch）；TouchNoteB 有自己的位置公式，天然排除。
+        if (__instance is TouchHoldC) return;
+        try
+        {
+            var tr = Traverse.Create(__instance);
+            var appear = tr.Field("AppearMsec").GetValue<float>();
+            float bounce;
+            if (!BounceDurationByNoteIndex.TryGetValue(tr.Field("NoteIndex").GetValue<int>(), out bounce) || bounce <= 0f)
+            {
+                // fallback：直接查段表（字典可能因加载顺序未构建——GetNoteList 在 loadMa2Main 后置可能为空）。
+                bounce = GetBounceDurationAt(appear);
+                if (bounce <= 0f) return;
+            }
+
+            var now = NotesManager.GetCurrentMsec();
+            var judgeOffset = now - appear;
+            var bMs = bounce * 1000f;
+
+            if (judgeOffset < -bMs)
+            {
+                // 弹跳窗口前：隐藏音符本体（外框保持原版逻辑）。
+                SetBounceAlpha(tr, 0f);
+                return;
+            }
+
+            if (judgeOffset < 0f)
+            {
+                // 弹跳窗口内：抛物线位置（判定线→生成半径→判定线）。
+                // 弹跳轨迹以【原版判定线位置】为起终点（含音符速度常量偏移 V_9），
+                // 否则外框在接近判定线时残留 -V_9 偏移、弧圈拼不齐。
+                var elapsed = Mathf.Clamp(judgeOffset + bMs, 0f, bMs);
+                var half = bMs * 0.5f;
+                var accel = 8f * (BounceJudgeLine - BounceSpawnRadius) / (bMs * bMs);
+                var fromApex = elapsed - half;
+                var distance = BounceSpawnRadius + 0.5f * accel * fromApex * fromApex;
+                var t = (distance - BounceSpawnRadius) / (BounceJudgeLine - BounceSpawnRadius);
+                var startPos = tr.Field("StartPos").GetValue<float>();
+                var endPos = tr.Field("EndPos").GetValue<float>();
+                var span = endPos - startPos;
+                var v9 = GetNoteSpeedOffsetY(__instance, span);
+                var bounceY = startPos + span * t + v9;
+                __result = bounceY;
+
+                // 外框（弧形提示线）：弧心固定在音符轨道圆心（屏幕中心，即原版 localPosition 不动），
+                // 只按音符当前径向位置缩放弧大小（Majdata tapLine：bounceLineScale = clamp01(distance/4.8)）。
+                // 音符圆环在 distance 半径处 → 弧缩放到同半径 → 与音符轨道同心。
+                try
+                {
+                    var guide = tr.Field("GuideObj").GetValue<NoteGuide>();
+                    var gt = guide != null ? guide.transform : tr.Field("NoteGuideTrans").GetValue<Transform>();
+                    if (gt != null)
+                    {
+                        var s = Mathf.Clamp01(distance / BounceJudgeLine);
+                        gt.localScale = new Vector3(s, s, 1f);
+                    }
+                }
+                catch
+                {
+                }
+
+                // 光效/绝赞：挂到 NoteObj 下跟随（音符的一部分，旋转无碍）。
+                ReparentBounceEffects(tr);
+
+                SetBounceAlpha(tr, 1f);
+                return;
+            }
+
+            // 判定后：恢复可见，外框缩放归位（弧心始终不动，scale 由原版每帧继续接管）。
+            try
+            {
+                var guide = tr.Field("GuideObj").GetValue<NoteGuide>();
+                var gt = guide != null ? guide.transform : tr.Field("NoteGuideTrans").GetValue<Transform>();
+                if (gt != null)
+                {
+                    gt.localScale = new Vector3(1f, 1f, 1f);
+                }
+            }
+            catch
+            {
+            }
+
+            SetBounceAlpha(tr, 1f);
+        }
+        catch
+        {
+        }
+    }
+
+    /// <summary>原版 GetNoteYPosition 的返回 = 插值位置 + V_9（音符速度常量偏移）：
+    /// V_9 = (EndPos−StartPos) × (−0.008333334) × (GetNoteSpeed()/150 − 1)。
+    /// GetNoteSpeed() 读 UserOption 的原始选项值（不经 HS postfix），与原版 IL 一致。</summary>
+    private static float GetNoteSpeedOffsetY(NoteBase note, float span)
+    {
+        try
+        {
+            var score = Singleton<GamePlayManager>.Instance.GetGameScore(note.MonitorId, -1);
+            var speed = score.UserOption.GetNoteSpeed;
+            var v8 = Convert.ToInt32(speed) / 150f;
+            return span * -0.008333334f * (v8 - 1f);
+        }
+        catch
+        {
+            return 0f;
+        }
+    }
+
+    /// <summary>光效/绝赞挂到 NoteObj 下（保持世界位置），随音符弹跳移动（音符的一部分，
+    /// 圆形/星形光效旋转无碍）。音符回池复用 Initialize 时层级由原版重新设置。
+    /// 外框（NoteGuide 弧形）不挂载——见 bounce 分支的 delta 位移方案。</summary>
+    private static void ReparentBounceEffects(Traverse tr)
+    {
+        try
+        {
+            var noteObj = tr.Field("NoteObj").GetValue<GameObject>();
+            if (noteObj == null) return;
+            var noteTrans = noteObj.transform;
+            var eff = tr.Field("EffectSprite").GetValue<SpriteRenderer>();
+            if (eff != null && eff.transform.parent != noteTrans)
+            {
+                eff.transform.SetParent(noteTrans, true);
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            var noteObj = tr.Field("NoteObj").GetValue<GameObject>();
+            if (noteObj == null) return;
+            var noteTrans = noteObj.transform;
+            var exObj = tr.Field("ExObj").GetValue<GameObject>();
+            if (exObj != null && exObj.transform.parent != noteTrans)
+            {
+                exObj.transform.SetParent(noteTrans, true);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private static void SetBounceAlpha(Traverse tr, float alpha)
+    {
+        var sr = tr.Field("SpriteRender").GetValue<SpriteRenderer>();
+        if (sr != null)
+        {
+            var c = sr.color;
+            c.a = alpha;
+            sr.color = c;
+        }
+
+        var srEx = tr.Field("SpriteRenderEx").GetValue<SpriteRenderer>();
+        if (srEx != null)
+        {
+            var c = srEx.color;
+            c.a = alpha;
+            srEx.color = c;
+        }
+    }
+
+    /*
+     * ========== ========== ========== ========== ========== ========== ========== ==========
+     * 地雷判定
+     *
+     * 原版的判定入口（非自动播放）：
+     *   - Tap / Star / BreakTap / Ex / ExBreak：NoteBase.Judge / NoteBase.JudgeToolate
+     *   - Touch：TouchNoteB.Judge（超时走 NoteBase.JudgeToolate）
+     *   - Slide：SlideRoot.Judge / SlideRoot.JudgeToolate
+     *   - Hold / BreakHold / TouchHold：JudgeTotalResult（头判 + 体判算出的最终结果）
+     * 它们都是同一个模式：算出 NoteJudge.ETiming 后 stfld 到 JudgeResult / JudgeHeadResult 字段。
+     * 计分(SetPlayResult)、判定显示(JudgeGrade)、特效全部读这个字段，
+     * 所以在写入字段前把地雷的判定反转即可：
+     *     命中（非 Miss） -> Miss（TooLate）
+     *     未命中（Miss）  -> Critical Perfect
+     * 本版本 NoteJudge.ETiming 里 TooFast=0 / TooLate=14 / End=15 是三种 Miss
+     * （NoteJudge.ConvertJudge 都映射到 JudgeBox.Miss），没有名为 Miss 的枚举值。
+     * 注：AutoJudge / GameManager.AutoJudge 只在自动播放时调用，手动判定不走那里。
+     */
+
+    /*
+     * ========== ========== ========== ========== ========== ========== ========== ==========
+     * HoldOn 地雷贴图（transpiler）
+     *
+     * HoldNote.HoldOn / BreakHoldNote.HoldOn / TouchHoldC.HoldOn 都是非虚方法（无法 override），
+     * 玩家按住/释放时会给 hold 条赋原版亮态贴图（NormalHoldOn / EachHoldOn / HoldOff /
+     * BreakHoldOn / TouchHoldGuide / TouchHoldGuideOff），把地雷贴图覆盖掉。
+     * 方案：transpiler 把方法里的 SpriteRenderer.set_sprite 调用替换成
+     *   ldarg.1; call SetHoldSpriteWithMine(SpriteRenderer, Sprite, bool on)
+     * （set_sprite 前栈是 [sr, sprite]，ldarg.1 压入 on 参数，栈形不变），
+     * helper 先执行原版赋值，再按地雷类型重贴对应贴图。
+     */
+
+    public static void SetHoldSpriteWithMine(SpriteRenderer sr, Sprite sprite, bool on)
+    {
+        if (sr == null) return;
+        sr.sprite = sprite;
+
+        var note = sr.GetComponentInParent<NoteBase>();
+        if (!_loggedHoldOn)
+        {
+            _loggedHoldOn = true;
+            MelonLogger.Msg($"[CustomNoteType] HoldOn transpiler active: sr={sr.gameObject.name} note={(note != null ? note.GetType().Name : "null")} on={on}");
+        }
+
+        if (note is MineTouchHoldC)
+        {
+            // touchhold 的 gauge：普通用 touchhold_off，绝赞（BRTHO，IsCriticalTouch）用 touchhold_break。
+            var critical = note.GetComponent<MineNoteBehaviour>()?.IsCriticalTouch == true;
+            ApplyHoldKeyToSprite(sr, critical ? "touchhold_break" : "touchhold_off");
+        }
+        else if (note is MineBreakHoldNote)
+        {
+            ApplyHoldKeyToSprite(sr, on ? "hold_break_mine_on" : "hold_break_mine");
+        }
+        else if (note is MineHoldNote)
+        {
+            ApplyHoldKeyToSprite(sr, on ? "hold_mine_on" : "hold_mine");
+        }
+    }
+
+    private static bool _loggedHoldOn;
+
+    private static void ApplyHoldKeyToSprite(SpriteRenderer sr, string textureKey)
+    {
+        if (!MineTextures.TryGetValue(textureKey, out var texture))
+        {
+            MelonLogger.Warning($"[CustomNoteType] Missing mine texture: {textureKey}");
+            return;
+        }
+
+        sr.sprite = CreateSpriteFromTexture(textureKey, texture, sr.sprite);
+    }
+
+    [HarmonyPatch]
+    public static class HoldOnMineTranspiler
+    {
+        public static IEnumerable<MethodBase> TargetMethods()
+        {
+            return
+            [
+                AccessTools.Method(typeof(HoldNote), "HoldOn"),
+                AccessTools.Method(typeof(BreakHoldNote), "HoldOn"),
+                AccessTools.Method(typeof(TouchHoldC), "HoldOn"),
+            ];
+        }
+
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            foreach (var inst in instructions)
+            {
+                // 用方法名匹配 SpriteRenderer.set_sprite（不依赖 Harmony 的 Calls 匹配，兼容 Cecil operand）。
+                if ((inst.opcode == OpCodes.Callvirt || inst.opcode == OpCodes.Call) &&
+                    GetMethodOperandName(inst.operand) == "set_sprite")
+                {
+                    // set_sprite 前栈是 [sr, sprite]；ldarg.1 压入 on → call helper 消费三个参数。
+                    // ⚠️ 被替换的指令可能带有分支标签 / 异常块边界（try/catch），必须转移到
+                    // 第一条替换指令上，否则 DMD 编译报 "Label #N is not marked"
+                    // （IL Compile Error，HoldOn 的 branch 目标就指向 set_sprite）。
+                    var ldarg = new CodeInstruction(OpCodes.Ldarg_1);
+                    ldarg.labels.AddRange(inst.labels);
+                    ldarg.blocks.AddRange(inst.blocks);
+                    yield return ldarg;
+                    yield return new CodeInstruction(OpCodes.Call,
+                        AccessTools.Method(typeof(CustomNoteTypes), nameof(SetHoldSpriteWithMine)));
+                    continue;
+                }
+
+                yield return inst;
+            }
+        }
+
+        private static string GetMethodOperandName(object operand)
+        {
+            if (operand is MethodInfo mi) return mi.Name;
+            var prop = operand?.GetType().GetProperty("Name");
+            return prop?.GetValue(operand) as string;
+        }
+    }
+
+    private static bool _loggedMissingFanTexture;
+
+    private static bool _loggedMineInversion;
+
+    /*
+     * ========== ========== ========== ========== ========== ========== ========== ==========
+     * slide 判定诊断 dump（文件，非控制台）
+     *
+     * 用户反馈"slide 划完仍是 good/great/criticalperfect 而非 miss"，原因不明时把判定流程
+     * 写到游戏目录 slide_judge_dump.txt（每局 OnStart 清空重写，最多 300 行）：
+     *   - ApplyMineJudgeTiming 收到 slide 实例（证明 transpiler 生效 + behaviour 是否存在）
+     *   - ApplyMineSlideGraceJudge 宽限写入（证明 GraceTranspiler 生效）
+     *   - NoteCheck 结束时 EndFlag/DispJudge/JudgeResult（游戏最终写入的值）
+     * 若某段完全没出现，说明对应的 transpiler/postfix 没生效。
+     * ========== ========== ========== ========== ========== ========== ========== ==========
+     */
+    private static readonly object SlideDumpLock = new object();
+    private static int SlideDumpCount;
+    private const int SlideDumpMax = 300;
+
+    private static void SlideDumpReset()
+    {
+        try
+        {
+            lock (SlideDumpLock)
+            {
+                SlideDumpCount = 0;
+                LastSlideEntryState.Clear();
+                var path = FileSystem.ResolvePath("slide_judge_dump.txt");
+                if (System.IO.File.Exists(path)) System.IO.File.Delete(path);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    internal static void SlideDump(string line)
+    {
+        try
+        {
+            lock (SlideDumpLock)
+            {
+                if (SlideDumpCount >= SlideDumpMax) return;
+                SlideDumpCount++;
+                System.IO.File.AppendAllText(FileSystem.ResolvePath("slide_judge_dump.txt"),
+                    $"[{SlideDumpCount}] {line}{Environment.NewLine}");
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    /// <summary>slide 当前状态摘要（dump 用）：lastWaitTime + hitIndex/Count（fan 按 3 条线）。</summary>
+    private static string SlideState(SlideRoot slide)
+    {
+        try
+        {
+            var t = Traverse.Create(slide);
+            var wait = t.Field("lastWaitTime").GetValue<float>();
+            if (slide is SlideFan)
+            {
+                var idx = t.Field("_hitIndex").GetValue<int[]>();
+                var areas = t.Field("_hitAreaList").GetValue<System.Collections.IEnumerable>();
+                var parts = new List<string>();
+                var i = 0;
+                foreach (var list in areas)
+                {
+                    var cnt = (list as System.Collections.ICollection)?.Count ?? -1;
+                    var h = idx != null && i < idx.Length ? idx[i] : -1;
+                    parts.Add($"{h}/{cnt}");
+                    i++;
+                }
+
+                return $"wait={wait:F1} lines=[{string.Join(",", parts)}]";
+            }
+
+            var count = -1;
+            var areas2 = t.Field("_hitAreaList").GetValue<System.Collections.ICollection>();
+            if (areas2 != null) count = areas2.Count;
+            return $"wait={wait:F1} hit={t.Field("_hitIndex").GetValue<int>()}/{count}";
+        }
+        catch
+        {
+            return "?";
+        }
+    }
+
+    /// <summary>确保地雷 note 挂了 MineNoteBehaviour（slide 特判用）。
+    /// SlideFan.Initialize 不调用 SlideRoot.Initialize，基类 postfix 链可能不触发，必须显式挂。
+    /// ⚠️ 不能只依赖 NoteKinds[data.indexNote]：slide 初始化拿到的 NoteData 的 indexNote
+    /// 可能与注册时不一致（历史 bug #22）——Mine* 类本身只可能来自地雷池，直接按类判定。</summary>
+    internal static void EnsureMineBehaviour(Component note, NoteData data)
+    {
+        try
+        {
+            if (note == null || data == null) return;
+
+            if (!NoteKinds.TryGetValue(data.indexNote, out var kind) || kind == CustomNoteKind.None)
+            {
+                // indexNote 查不到（slide 的 NoteData indexNote 与注册不一致）→ 按类兜底。
+                if (note is not (MineSlideRoot or MineSlideFan)) return;
+                kind = CustomNoteKind.Mine;
+            }
+
+            var behaviour = note.gameObject.GetComponent<MineNoteBehaviour>();
+            if (behaviour == null)
+            {
+                behaviour = note.gameObject.AddComponent<MineNoteBehaviour>();
+                SlideDump($"AttachBehaviour {note.GetType().Name} indexNote={data.indexNote} kind={kind}");
+            }
+
+            behaviour.Setup(data.indexNote,
+                kind is CustomNoteKind.Mine or CustomNoteKind.MineCriticalTouch,
+                kind is CustomNoteKind.CriticalTouch or CustomNoteKind.MineCriticalTouch,
+                applyTextures: false);
+        }
+        catch
+        {
+        }
+    }
+
+    /// <summary>判断是不是地雷 note（简单键类型；slide 不在这里处理）。
+    /// ⚠️ 必须按类判断：自反转类（tap/star/break/touch）按历史设计不挂 MineNoteBehaviour，
+    /// 用 behaviour 判断会导致自动 CP 对它们完全不触发（历史 bug #25）。</summary>
+    private static bool IsMineSimpleNote(NoteBase note)
+    {
+        return note is MineTapNote or MineStarNote or MineBreakNote or MineBreakStarNote
+            or MineHoldNote or MineBreakHoldNote or MineTouchNoteB or MineTouchNoteC or MineTouchHoldC;
+    }
+
+    /// <summary>地雷键自动判定：按键到达判定线那一刻自动判 Critical Perfect，不需要玩家碰。
+    /// 只取 autoplay 的"到线判 CP"时机，不改动其它任何行为（不自动推进、不忽略触摸）：
+    /// 玩家在判定线之前碰到 → 正常判定路径（打偏 → Miss）；不碰 → 到线自动 CP，从这一帧起
+    /// 不再有任何 late/miss 判定（note 直接以 CP 收尾）。
+    /// slide 不适用：slide 有自己的规则（星星到底=CP、提前划完=Miss，见 ApplyMineJudgeTiming）。</summary>
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(NoteBase), "SetAutoPlayJudge")]
+    public static void MineAutoJudgePostfix(NoteBase __instance)
+    {
+        try
+        {
+            if (!IsMineSimpleNote(__instance)) return;
+            // 已判过（玩家判定线前碰到 = Miss / 已自动 CP）→ 不动
+            if (__instance.GetJudgeResult() != NoteJudge.ETiming.End) return;
+            // 原版 autoplay 门槛：判定线前 4.17ms 内
+            var now = NotesManager.GetCurrentMsec();
+            var appear = Traverse.Create(__instance).Field("AppearMsec").GetValue<float>();
+            if (now < appear - 4.166667f) return;
+            // 到轨道 → 自动 Critical Perfect（AutoJudge 在非 autoplay 模式返回 TooFast，不能直接用它）
+            Traverse.Create(__instance).Field("JudgeResult").SetValue(NoteJudge.ETiming.Critical);
+            Traverse.Create(__instance).Method("PlayJudgeSe").GetValue();
+        }
+        catch
+        {
+        }
+    }
+
+    /// <summary>地雷 hold/touchhold 视作 autoplay（自动按住到尾部，不碰=按住到底判 CP）。</summary>
+    private static bool _loggedHoldAutoPlay;
+    private static bool _loggedHoldTouchMiss;
+
+    public static bool IsAutoPlayOrMineHold(object instance)
+    {
+        if (instance is MineHoldNote or MineBreakHoldNote or MineTouchHoldC)
+        {
+            if (!_loggedHoldAutoPlay)
+            {
+                _loggedHoldAutoPlay = true;
+                MelonLogger.Msg($"[CustomNoteType] Mine hold auto-hold active (type={instance.GetType().Name})");
+            }
+
+            return true;
+        }
+
+        return GameManager.IsAutoPlay();
+    }
+
+    /// <summary>地雷 hold 的自动判定值（AutoJudge 在非 autoplay 模式返回 TooFast，不能用）。</summary>
+    public static NoteJudge.ETiming MineHoldAutoJudge(object instance)
+    {
+        if (instance is MineHoldNote or MineBreakHoldNote or MineTouchHoldC) return NoteJudge.ETiming.Critical;
+        return GameManager.AutoJudge();
+    }
+
+    /// <summary>被碰到的地雷 hold（该次 use 立即 Miss，JudgeTotalResult 后置也按登记强制 Miss）。</summary>
+    private static readonly HashSet<NoteBase> MineHoldTouched = new HashSet<NoteBase>();
+
+    /// <summary>地雷 hold/touchhold 判定：
+    /// - 不碰：像 autoplay 一样自动按住（头自动 CP、条自动按满）直到判定期间最后，判 CP。
+    /// - 判定期间（判定线前 ~16.7ms 到尾部）被碰到：立即 Miss（直接收尾）。
+    /// 实现：把 NoteCheck/SetAutoPlayJudge/JudgeTotalResult 里的 IsAutoPlay()/AutoJudge()
+    /// 换成地雷感知版本（自动按住），触摸检测由 NoteCheck 后置单独做（立即 Miss）。</summary>
+    [HarmonyPatch]
+    public static class MineHoldAutoPlayTranspiler
+    {
+        public static IEnumerable<MethodBase> TargetMethods()
+        {
+            return
+            [
+                AccessTools.Method(typeof(HoldNote), "NoteCheck"),
+                AccessTools.Method(typeof(BreakHoldNote), "NoteCheck"),
+                AccessTools.Method(typeof(TouchHoldC), "NoteCheck"),
+                AccessTools.Method(typeof(HoldNote), "JudgeTotalResult"),
+                AccessTools.Method(typeof(BreakHoldNote), "JudgeTotalResult"),
+                AccessTools.Method(typeof(TouchHoldC), "JudgeTotalResult"),
+                AccessTools.Method(typeof(HoldNote), "SetAutoPlayJudge"),
+                AccessTools.Method(typeof(TouchHoldC), "SetAutoPlayJudge"),
+                // ⚠️ BreakHoldNote 的基类是 NoteBase（不是 HoldNote！），它自己 override 了
+                // SetAutoPlayJudge——漏掉会导致绝赞地雷 hold 的头自动判定不生效（历史 bug #28）。
+                AccessTools.Method(typeof(BreakHoldNote), "SetAutoPlayJudge"),
+            ];
+        }
+
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            foreach (var inst in instructions)
+            {
+                if (inst.opcode == OpCodes.Call && GetMethodOperandName(inst.operand) == "IsAutoPlay")
+                {
+                    // call IsAutoPlay() → ldarg.0; call IsAutoPlayOrMineHold(object)
+                    // ⚠️ 被替换指令可能带分支标签/异常块边界，必须转移到第一条替换指令
+                    // （历史 bug #17/#27：否则 "Label #N is not marked" → patch 全挂）。
+                    var ldarg = new CodeInstruction(OpCodes.Ldarg_0);
+                    ldarg.labels.AddRange(inst.labels);
+                    ldarg.blocks.AddRange(inst.blocks);
+                    yield return ldarg;
+                    yield return new CodeInstruction(OpCodes.Call,
+                        AccessTools.Method(typeof(CustomNoteTypes), nameof(IsAutoPlayOrMineHold)));
+                    continue;
+                }
+
+                if (inst.opcode == OpCodes.Call && GetMethodOperandName(inst.operand) == "AutoJudge")
+                {
+                    // call AutoJudge() → ldarg.0; call MineHoldAutoJudge(object)
+                    var ldarg = new CodeInstruction(OpCodes.Ldarg_0);
+                    ldarg.labels.AddRange(inst.labels);
+                    ldarg.blocks.AddRange(inst.blocks);
+                    yield return ldarg;
+                    yield return new CodeInstruction(OpCodes.Call,
+                        AccessTools.Method(typeof(CustomNoteTypes), nameof(MineHoldAutoJudge)));
+                    continue;
+                }
+
+                yield return inst;
+            }
+        }
+
+        private static string GetMethodOperandName(object operand)
+        {
+            if (operand is MethodInfo mi) return mi.Name;
+            var prop = operand?.GetType().GetProperty("Name");
+            return prop?.GetValue(operand) as string;
+        }
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(HoldNote), "NoteCheck")]
+    public static void MineHoldNoteCheckTouch(HoldNote __instance)
+    {
+        MineHoldTouchCheck(__instance);
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(BreakHoldNote), "NoteCheck")]
+    public static void MineBreakHoldNoteCheckTouch(BreakHoldNote __instance)
+    {
+        MineHoldTouchCheck(__instance);
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(TouchHoldC), "NoteCheck")]
+    public static void MineTouchHoldNoteCheckTouch(TouchHoldC __instance)
+    {
+        MineHoldTouchCheck(__instance);
+    }
+
+    /// <summary>判定期间（判定线前 ~16.7ms 到尾部）被碰到 → 立即 Miss。</summary>
+    private static void MineHoldTouchCheck(NoteBase note)
+    {
+        try
+        {
+            if (note is not (MineHoldNote or MineBreakHoldNote or MineTouchHoldC)) return;
+            if (MineHoldTouched.Contains(note)) return;
+            if (note.GetJudgeResult() != NoteJudge.ETiming.End) return;
+
+            var now = NotesManager.GetCurrentMsec();
+            var traverse = Traverse.Create(note);
+            var appear = traverse.Field("AppearMsec").GetValue<float>();
+            var tail = traverse.Field("TailMsec").GetValue<float>();
+            if (now < appear - 16.7f || now > tail) return;
+
+            bool touched;
+            if (note is TouchHoldC)
+            {
+                // touchhold（B 传感器）用自己的触发检测
+                touched = traverse.Method("IsHoldTriggerDown").GetValue<bool>() ||
+                          traverse.Method("IsHoldTriggerPush").GetValue<bool>();
+            }
+            else
+            {
+                var monitorId = note.MonitorId;
+                // NoteBase.ButtonId 是 protected，用 Traverse 读
+                var button = (InputManager.ButtonSetting)traverse.Property("ButtonId").GetValue<int>();
+                touched = InputManager.InGameButtonDown(monitorId, button) ||
+                          InputManager.InGameTouchPanelAreaDown(monitorId, button) ||
+                          InputManager.GetButtonPush(monitorId, button) ||
+                          InputManager.GetTouchPanelAreaPush(monitorId, button);
+            }
+
+            if (!touched) return;
+
+            // 碰到 → 立即 Miss：先登记（JudgeTotalResult 后置会覆盖写入，靠登记强制 Miss），再直接收尾显示。
+            MineHoldTouched.Add(note);
+            traverse.Field("JudgeResult").SetValue(NoteJudge.ETiming.TooLate);
+            traverse.Method("EndNote").GetValue();
+            if (!_loggedHoldTouchMiss)
+            {
+                _loggedHoldTouchMiss = true;
+                MelonLogger.Msg($"[CustomNoteType] Mine hold touched -> immediate Miss (type={note.GetType().Name})");
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    /// <summary>hold 复用时清除"被碰到"登记（池对象复用）。</summary>
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(HoldNote), "Initialize")]
+    public static void HoldInitClearTouched(HoldNote __instance)
+    {
+        MineHoldTouched.Remove(__instance);
+    }
+
+    /// <summary>绝赞 touchhold（CriticalTouchHoldC）命中强制 Critical Perfect（未命中保持 Miss）。
+    /// JudgeTotalResult 非虚无法 override，用 postfix；绝赞 touchhold 实现 ISelfJudgingMineNote，
+    /// 全局反转 transpiler 对它的 JudgeTotalResult 后置放行，不会冲突。</summary>
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(TouchHoldC), "JudgeTotalResult")]
+    public static void CriticalTouchHoldJudgePostfix(TouchHoldC __instance)
+    {
+        try
+        {
+            if (__instance is not CriticalTouchHoldC) return;
+            var timing = __instance.GetJudgeResult();
+            // 命中（原判定不是 Miss 三值）→ CP；未命中保持原版 Miss。
+            if (timing != NoteJudge.ETiming.TooFast &&
+                timing != NoteJudge.ETiming.TooLate &&
+                timing != NoteJudge.ETiming.End)
+            {
+                MineJudgeHelper.SetJudgeResult(__instance, NoteJudge.ETiming.Critical);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(TouchHoldC), "Initialize")]
+    public static void TouchHoldInitClearTouched(TouchHoldC __instance)
+    {
+        MineHoldTouched.Remove(__instance);
+    }
+
+    public static NoteJudge.ETiming ApplyMineJudgeTiming(NoteJudge.ETiming timing, object note)
+    {
+        // 独立地雷类（ISelfJudgingMineNote）自己负责反转（override Judge / JudgeToolate），
+        // 这里必须放行，否则双重反转。Hold/Slide 等非自反转类继续由 transpiler 反转。
+        if (note is ISelfJudgingMineNote) return timing;
+
+        // 被碰到的地雷 hold：判定强制 Miss（JudgeTotalResult 后置会覆盖之前的写入，靠登记兜底）。
+        if (note is NoteBase touchedHold && MineHoldTouched.Contains(touchedHold))
+        {
+            return NoteJudge.ETiming.TooLate;
+        }
+
+        var behaviour = (note as Component)?.GetComponent<MineNoteBehaviour>();
+        // MineSlideRoot/MineSlideFan 只可能来自地雷池——即使 behaviour 没挂上（NoteKinds 按
+        // indexNote 查不到导致 EnsureMineBehaviour 兜底失败），也按地雷处理（历史 bug #22）。
+        if ((behaviour == null || !behaviour.IsMine) && note is not (MineSlideRoot or MineSlideFan)) return timing;
+
+        if (!_loggedMineInversion)
+        {
+            _loggedMineInversion = true;
+            MelonLogger.Msg($"[CustomNoteType] Mine judge inversion active (first mine: note {(behaviour != null ? behaviour.NoteIndex : -1)})");
+        }
+
+        // slide 特判（用户 2026-08 最终规则）：SlideRoot.Judge 只在全部轨道被划掉时被调用
+        // （NoteCheck 里 hitIndex >= count 才调），JudgeToolate 反之（没划完/星星滑到末尾）。
+        //   划完（提前划掉全部轨道，打中）→ Miss(TooLate 14)
+        //   没划完（星星跟着轨道滑到最后）→ Critical Perfect(7)
+        if (note is SlideRoot slide)
+        {
+            var completed = IsMineSlideCompleted(slide);
+            var result = completed ? NoteJudge.ETiming.TooLate : NoteJudge.ETiming.Critical;
+            SlideDump($"JudgeTiming {slide.GetType().Name} id={slide.gameObject.GetInstanceID()} bh={(behaviour != null ? $"IsMine({behaviour.IsMine})" : "NULL")} raw={timing} completed={completed} -> {result} {SlideState(slide)}");
+            return result;
+        }
+
+        // 触摸映射（简单键）：刚好那帧（Critical）→ CP，其余（打偏 good/great、超窗）→ Miss。
+        return InvertMineTiming(timing);
+    }
+
+    /// <summary>slide 是否"划完"：SlideRoot 看 _hitIndex >= _hitAreaList.Count - 1；
+    /// SlideFan（3 条线）要求每条线都 >= 各自的 Count - 1（与原版 grace 判定条一致）。</summary>
+    private static bool IsMineSlideCompleted(SlideRoot slide)
+    {
+        try
+        {
+            var traverse = Traverse.Create(slide);
+            if (slide is SlideFan)
+            {
+                var hitIndexes = traverse.Field("_hitIndex").GetValue<int[]>();
+                var areaLists = traverse.Field("_hitAreaList").GetValue<System.Collections.IEnumerable>();
+                if (hitIndexes == null || areaLists == null) return false;
+                var i = 0;
+                foreach (var list in areaLists)
+                {
+                    var count = (list as System.Collections.ICollection)?.Count ?? 0;
+                    if (i >= hitIndexes.Length || hitIndexes[i] < count - 1) return false;
+                    i++;
+                }
+
+                return i >= 3;
+            }
+            else
+            {
+                var hitIndex = traverse.Field("_hitIndex").GetValue<int>();
+                var areas = traverse.Field("_hitAreaList").GetValue<System.Collections.ICollection>();
+                return areas != null && hitIndex >= areas.Count - 1;
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>NoteCheck 结束（滑动判定发生的那一帧）后 dump 游戏最终写入的判定值。
+    /// EndFlag/DispJudge 只在判定收尾帧为 true（Initialize 会复位），不会刷屏。</summary>
+    // JudgeToolate 每帧都会被调（JudgeResult==15 期间），入口 dump 只在状态变化时记一行，
+    // 否则会把 300 行预算刷光（历史上一次测试 250 行全是同一个 fan 的重复入口）。
+    private static readonly Dictionary<int, string> LastSlideEntryState = new Dictionary<int, string>();
+
+    private static void DumpSlideEntry(SlideRoot slide, string label)
+    {
+        if (slide is not (MineSlideRoot or MineSlideFan)) return;
+        try
+        {
+            var state = SlideState(slide);
+            var id = slide.gameObject.GetInstanceID();
+            if (LastSlideEntryState.TryGetValue(id, out var last) && last == state) return;
+            LastSlideEntryState[id] = state;
+            SlideDump($"{label} {slide.GetType().Name} id={id} {state}");
+        }
+        catch
+        {
+        }
+    }
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(SlideRoot), "Judge")]
+    public static void SlideJudgeEntryDump(SlideRoot __instance)
+    {
+        DumpSlideEntry(__instance, "JudgeEntry");
+    }
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(SlideRoot), "JudgeToolate")]
+    public static void SlideJudgeToolateEntryDump(SlideRoot __instance)
+    {
+        DumpSlideEntry(__instance, "JudgeToolateEntry");
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(SlideRoot), "NoteCheck")]
+    public static void SlideRootNoteCheckEndDump(SlideRoot __instance)
+    {
+        DumpSlideNoteCheckEnd(__instance);
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(SlideFan), "NoteCheck")]
+    public static void SlideFanNoteCheckEndDump(SlideFan __instance)
+    {
+        DumpSlideNoteCheckEnd(__instance);
+    }
+
+    private static void DumpSlideNoteCheckEnd(SlideRoot slide)
+    {
+        try
+        {
+            var traverse = Traverse.Create(slide);
+            var endFlag = traverse.Field("EndFlag").GetValue<bool>();
+            var dispJudge = traverse.Field("DispJudge").GetValue<bool>();
+            if (!endFlag && !dispJudge) return;
+            var judge = traverse.Field("JudgeResult").GetValue<NoteJudge.ETiming>();
+            var mine = slide is MineSlideRoot or MineSlideFan ||
+                       slide.GetComponent<MineNoteBehaviour>()?.IsMine == true;
+            SlideDump($"NoteCheckEnd {slide.GetType().Name} id={slide.gameObject.GetInstanceID()} mine={mine} EndFlag={endFlag} DispJudge={dispJudge} JudgeResult={judge} {SlideState(slide)}");
+        }
+        catch
+        {
+        }
+    }
+
+    private static NoteJudge.ETiming InvertMineTiming(NoteJudge.ETiming timing) => MineJudgeHelper.Invert(timing);
+
+    [HarmonyPatch]
+    public static class MineJudgeInversion
+    {
+        public static IEnumerable<MethodBase> TargetMethods()
+        {
+            return
+            [
+                AccessTools.Method(typeof(NoteBase), "Judge"),
+                AccessTools.Method(typeof(NoteBase), "JudgeToolate"),
+                AccessTools.Method(typeof(TouchNoteB), "Judge"),
+                AccessTools.Method(typeof(SlideRoot), "Judge"),
+                AccessTools.Method(typeof(SlideRoot), "JudgeToolate"),
+                AccessTools.Method(typeof(HoldNote), "JudgeTotalResult"),
+                AccessTools.Method(typeof(BreakHoldNote), "JudgeTotalResult"),
+                AccessTools.Method(typeof(TouchHoldC), "JudgeTotalResult"),
+            ];
+        }
+
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            foreach (var inst in instructions)
+            {
+                if (inst.opcode == OpCodes.Stfld && IsJudgeResultField(inst.operand))
+                {
+                    // ⚠️ 后置反转（历史 bug #23）：原版 SlideRoot.Judge 里有 br.s 分支直接跳到
+                    // stfld JudgeResult（GetSlideJudgeTiming 路径和 autoplay 路径都是），
+                    // 前置插入（ldarg.0; call）会被分支跳过 → 原值直写 → 显示 good/great/cp。
+                    // 保留原 stfld（分支目标依然有效），在它后面插：
+                    //   ldarg.0; ldstr "JudgeResult"; call ApplyMineJudgePostWrite(object, string)
+                    // stfld 后栈为空，ldarg.0+ldstr+call 不破坏栈形，且所有路径必然经过。
+                    yield return inst;
+                    yield return new CodeInstruction(OpCodes.Ldarg_0);
+                    yield return new CodeInstruction(OpCodes.Ldstr, GetJudgeResultFieldName(inst.operand));
+                    yield return new CodeInstruction(OpCodes.Call,
+                        AccessTools.Method(typeof(MineJudgeInversion), nameof(ApplyMineJudgePostWrite)));
+                    continue;
+                }
+
+                yield return inst;
+            }
+        }
+
+        /// <summary>后置反转：读取刚写入的判定值 → ApplyMineJudgeTiming 决定反转结果 → 写回。
+        /// 非地雷 / ISelfJudgingMineNote 返回原值不写（自反转类自己负责）。</summary>
+        public static void ApplyMineJudgePostWrite(object note, string fieldName)
+        {
+            try
+            {
+                if (note == null || fieldName == null) return;
+                var traverse = Traverse.Create(note);
+                var timing = traverse.Field(fieldName).GetValue<NoteJudge.ETiming>();
+                var result = ApplyMineJudgeTiming(timing, note);
+                if (result != timing)
+                {
+                    traverse.Field(fieldName).SetValue(result);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static string GetJudgeResultFieldName(object operand)
+        {
+            if (operand is FieldInfo field)
+            {
+                return field.Name;
+            }
+
+            var nameProp = operand?.GetType().GetProperty("Name");
+            return nameProp?.GetValue(operand) as string;
+        }
+    }
+
+    /// <summary>判断 stfld 的 operand 是否是判定字段（Harmony 可能给 FieldInfo 或 Mono.Cecil FieldReference）。</summary>
+    private static bool IsJudgeResultField(object operand)
+    {
+        if (operand is FieldInfo field)
+        {
+            return field.Name == "JudgeResult" || field.Name == "JudgeHeadResult";
+        }
+
+        // Mono.Cecil FieldReference（Harmony 的 CodeInstruction 可能持有 Cecil 引用）。
+        var nameProp = operand?.GetType().GetProperty("Name");
+        var name = nameProp?.GetValue(operand) as string;
+        return name == "JudgeResult" || name == "JudgeHeadResult";
+    }
+
+    /// <summary>NoteCheck 里"滑完全部轨道但略迟"宽限写入的替换：
+    /// 原版把 TooLate 升成 LateGood(13)——地雷划完 = Miss，宽限写入的地雷结果保持 Miss(TooLate)，
+    /// 非地雷保持 13。grace 只会在"划完且原判定 TooLate"时触发，与新规则一致。</summary>
+    public static void ApplyMineSlideGraceJudge(SlideRoot slide)
+    {
+        // Mine* 类按类兜底（历史 bug #22），不依赖 behaviour。
+        var isMine = slide is MineSlideRoot or MineSlideFan ||
+                     slide?.GetComponent<MineNoteBehaviour>()?.IsMine == true;
+        var timing = isMine ? NoteJudge.ETiming.TooLate : (NoteJudge.ETiming)13;
+        SlideDump($"GraceJudge {slide?.GetType().Name} id={(slide != null ? slide.gameObject.GetInstanceID() : -1)} mine={isMine} -> {timing}");
+        Traverse.Create(slide).Field("JudgeResult").SetValue(timing);
+    }
+
+    [HarmonyPatch]
+    public static class SlideGraceJudgeTranspiler
+    {
+        public static IEnumerable<MethodBase> TargetMethods()
+        {
+            return
+            [
+                AccessTools.Method(typeof(SlideRoot), "NoteCheck"),
+                AccessTools.Method(typeof(SlideFan), "NoteCheck"),
+            ];
+        }
+
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            var list = instructions.ToList();
+            for (var i = 0; i < list.Count; i++)
+            {
+                var inst = list[i];
+                // 原版"滑完全部轨道但最后一下略迟 → LateGood(13)"的宽限写入，
+                // 序列是 ldarg.0; ldc.i4.s 13; stfld JudgeResult。
+                // 把 ldc+stfld 换成 call ApplyMineSlideGraceJudge（前面的 ldarg.0 保留作 this）。
+                if (i > 0 && list[i - 1].opcode == OpCodes.Ldarg_0 &&
+                    (inst.opcode == OpCodes.Ldc_I4_S || inst.opcode == OpCodes.Ldc_I4) &&
+                    Convert.ToInt32(inst.operand) == 13 &&
+                    i + 1 < list.Count && list[i + 1].opcode == OpCodes.Stfld &&
+                    IsJudgeResultField(list[i + 1].operand))
+                {
+                    var call = new CodeInstruction(OpCodes.Call,
+                        AccessTools.Method(typeof(CustomNoteTypes), nameof(ApplyMineSlideGraceJudge)));
+                    // 被替换指令可能带分支标签/异常块，必须转移到 call 上（历史 bug #17/#27）。
+                    call.labels.AddRange(inst.labels);
+                    call.blocks.AddRange(inst.blocks);
+                    if (list[i + 1].labels.Count > 0) call.labels.AddRange(list[i + 1].labels);
+                    if (list[i + 1].blocks.Count > 0) call.blocks.AddRange(list[i + 1].blocks);
+                    yield return call;
+                    i++; // 跳过紧随其后的 stfld
+                    continue;
+                }
+
+                yield return inst;
+            }
+        }
+    }
+
+    /// <summary>slide 收尾等待条件（原版：lastWaitTime <= 0 || JudgeResult == TooLate(14)）的地雷扩展：
+    /// 地雷 slide 没划完时 JudgeToolate 的反转结果是 Critical(7)，原版条件不认 → 收尾会多等
+    /// lastWaitTime 耗尽才显示 CP（"星星滑到底部要过一会才判 CP"）。补上 mine && Critical → 立即收尾。</summary>
+    public static bool IsMineSlideEndWaitDone(SlideRoot slide)
+    {
+        try
+        {
+            if (slide == null) return true;
+            var wait = Traverse.Create(slide).Field("lastWaitTime").GetValue<float>();
+            if (wait <= 0f) return true;
+            var judge = slide.GetJudgeResult();
+            if (judge == NoteJudge.ETiming.TooLate) return true;
+            if (judge == NoteJudge.ETiming.Critical && slide is (MineSlideRoot or MineSlideFan)) return true;
+            return false;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    [HarmonyPatch]
+    public static class SlideEndWaitTranspiler
+    {
+        public static IEnumerable<MethodBase> TargetMethods()
+        {
+            return
+            [
+                AccessTools.Method(typeof(SlideRoot), "NoteCheck"),
+                AccessTools.Method(typeof(SlideFan), "NoteCheck"),
+            ];
+        }
+
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            var list = instructions.ToList();
+            for (var i = 0; i < list.Count; i++)
+            {
+                var inst = list[i];
+                // 原版收尾等待条件的后半段：call GetJudgeResult; ldc.i4.s 14; ceq
+                // → ldarg.0; call IsMineSlideEndWaitDone(object)
+                if ((inst.opcode == OpCodes.Call || inst.opcode == OpCodes.Callvirt) &&
+                    GetMethodOperandName(inst.operand) == "GetJudgeResult" &&
+                    i + 2 < list.Count &&
+                    (list[i + 1].opcode == OpCodes.Ldc_I4_S || list[i + 1].opcode == OpCodes.Ldc_I4) &&
+                    Convert.ToInt32(list[i + 1].operand) == 14 &&
+                    list[i + 2].opcode == OpCodes.Ceq)
+                {
+                    var call = new CodeInstruction(OpCodes.Call,
+                        AccessTools.Method(typeof(CustomNoteTypes), nameof(IsMineSlideEndWaitDone)));
+                    // 被替换指令可能带分支标签/异常块，必须转移（历史 bug #17/#27）。
+                    call.labels.AddRange(inst.labels);
+                    call.blocks.AddRange(inst.blocks);
+                    if (list[i + 1].labels.Count > 0) call.labels.AddRange(list[i + 1].labels);
+                    if (list[i + 1].blocks.Count > 0) call.blocks.AddRange(list[i + 1].blocks);
+                    if (list[i + 2].labels.Count > 0) call.labels.AddRange(list[i + 2].labels);
+                    if (list[i + 2].blocks.Count > 0) call.blocks.AddRange(list[i + 2].blocks);
+                    yield return new CodeInstruction(OpCodes.Ldarg_0);
+                    yield return call;
+                    i += 2; // 跳过 ldc + ceq
+                    continue;
+                }
+
+                yield return inst;
+            }
+        }
+
+        private static string GetMethodOperandName(object operand)
+        {
+            if (operand is MethodInfo mi) return mi.Name;
+            var prop = operand?.GetType().GetProperty("Name");
+            return prop?.GetValue(operand) as string;
+        }
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(GameCtrl), "CreateNotePool")]
+    public static void CreateNotePoolPostfix(GameCtrl __instance)
+    {
+        if (MinePools.ContainsKey(__instance)) return;
+
+        var pools = new Dictionary<string, object>();
+        // 注意：泛型参数必须显式给基类类型（TapNote 等）——游戏字段是 List<基类>，
+        // 若按 lambda 返回类型推断成 Mine* 子类，List<Mine*> 无法转 List<基类>（泛型不变性）。
+        AddMinePoolWithFactory<TapNote>(pools, __instance, "_tapObjectList", "_tapListParent", p => MineTapNote.CreateFrom(GameNotePrefabContainer.Tap, p));
+        AddMinePoolWithFactory<HoldNote>(pools, __instance, "_holdObjectList", "_holdListParent", p => MineHoldNote.CreateFrom(GameNotePrefabContainer.Hold, p));
+        AddMinePoolWithFactory<BreakHoldNote>(pools, __instance, "_breakHoldObjectList", "_breakHoldListParent", p => MineBreakHoldNote.CreateFrom(GameNotePrefabContainer.BreakHold, p));
+        AddMinePoolWithFactory<StarNote>(pools, __instance, "_starObjectList", "_starListParent", p => MineStarNote.CreateFrom(GameNotePrefabContainer.Star, p));
+        AddMinePoolWithFactory<BreakStarNote>(pools, __instance, "_breakStarObjectList", "_breakStarListParent", p => MineBreakStarNote.CreateFrom(GameNotePrefabContainer.BreakStar, p));
+        AddMinePoolWithFactory<BreakNote>(pools, __instance, "_breakObjectList", "_breakListParent", p => MineBreakNote.CreateFrom(GameNotePrefabContainer.Break, p));
+        AddMinePoolWithFactory<TouchNoteB>(pools, __instance, "_touchBObjectList", "_touchListParent", p => MineTouchNoteB.CreateFrom(GameNotePrefabContainer.TouchTapB, p));
+        AddMinePoolWithFactory<TouchNoteC>(pools, __instance, "_touchCTapObjectList", "_touchCTapListParent", p => MineTouchNoteC.CreateFrom(GameNotePrefabContainer.TouchTapC, p));
+        AddMinePoolWithFactory<TouchHoldC>(pools, __instance, "_touchBHoldObjectList", "_touchHoldListParent", p => MineTouchHoldC.CreateFrom(GameNotePrefabContainer.TouchHoldC, p));
+        AddMinePoolWithFactory<TouchHoldC>(pools, __instance, "_touchCHoldObjectList", "_touchCHoldListParent", p => MineTouchHoldC.CreateFrom(GameNotePrefabContainer.TouchHoldC, p));
+        // slide 本体不在此贴图（贴图会遍历子物体误伤内部星）；轨道/箭头由独立地雷箭头池负责。
+        AddMinePoolWithFactory<SlideRoot>(pools, __instance, "_slideObjectList", "_slideListParent", p => MineSlideRoot.CreateFrom(GameNotePrefabContainer.Slide, p), applyTextures: false);
+        // fan slide（Wi-Fi）：MineSlideFan 独立类，Initialize 时贴 wifi_mine_0-10 轨道线。
+        AddMinePoolWithFactory<SlideFan>(pools, __instance, "_fanSlideObjectList", "_fanSlideListParent", p => MineSlideFan.CreateFrom(GameNotePrefabContainer.SlideFan, p), applyTextures: false);
+        AddArrowPools(pools, __instance);
+        MinePools[__instance] = pools;
+
+        // 绝赞独立池（touch tap + touchhold；C 传感器绝赞罕见，未建池时回退原版池）。
+        var criticalPools = new Dictionary<string, object>();
+        AddMinePoolWithFactory<TouchNoteB>(criticalPools, __instance, "_touchBObjectList", "_touchListParent", p => CriticalTouchNoteB.CreateFrom(GameNotePrefabContainer.TouchTapB, p));
+        AddMinePoolWithFactory<TouchHoldC>(criticalPools, __instance, "_touchBHoldObjectList", "_touchHoldListParent", p => CriticalTouchHoldC.CreateFrom(GameNotePrefabContainer.TouchHoldC, p));
+        CriticalTouchPools[__instance] = criticalPools;
+
+        MelonLogger.Msg($"[CustomNoteType] Mine pools ready: {string.Join(", ", pools.Select(p => $"{p.Key}={((System.Collections.ICollection)p.Value).Count}"))}");
+    }
+
+    // 按原版同类型池的数量，用 factory 为一种 note 类型创建独立地雷池。
+    // TBase 必须是原版组件基类（如 TapNote），与游戏池字段 List<TBase> 一致；
+    // factory 返回 Mine* 独立类对象（TBase 子类，组件替换）或原版组件克隆（如 SlideFan）。
+    // applyTextures=false 时不在创建时贴图（如 slide：贴图会遍历子物体误伤内部星）。
+    private static void AddMinePoolWithFactory<TBase>(Dictionary<string, object> pools, GameCtrl instance,
+        string listField, string parentField, Func<Transform, TBase> factory, bool applyTextures = true) where TBase : Component
+    {
+        try
+        {
+            var gameList = Traverse.Create(instance).Field(listField).GetValue<List<TBase>>();
+            var parent = Traverse.Create(instance).Field(parentField).GetValue<GameObject>();
+            if (gameList == null || parent == null) return;
+
+            var list = new List<TBase>();
+            foreach (var unused in gameList)
+            {
+                var note = factory(parent.transform);
+                note.gameObject.SetActive(false);
+                TrySetParentTransform(note, parent.transform);
+                if (applyTextures)
+                {
+                    ApplyMineTexturesToObject(note.gameObject);
+                }
+
+                list.Add(note);
+            }
+
+            pools[listField] = list;
+        }
+        catch (Exception e)
+        {
+            MelonLogger.Error($"[CustomNoteType] Failed to create mine pool {listField}: {e}");
+        }
+    }
+
+    // slide 轨道箭头地雷池（_arrowObjectList / _breakArrowObjectList）：
+    // RegistNote 的 slide 分支从这里取箭头（SetArrowObject），换好地雷贴图避免污染共享箭头池。
+    private static void AddArrowPools(Dictionary<string, object> pools, GameCtrl instance)
+    {
+        try
+        {
+            var arrows = Traverse.Create(instance).Field("_arrowObjectList").GetValue<List<SpriteRenderer>>();
+            if (arrows != null)
+            {
+                var list = new List<SpriteRenderer>();
+                foreach (var unused in arrows)
+                {
+                    var sr = UnityEngine.Object.Instantiate(GameNotePrefabContainer.Arrow);
+                    sr.gameObject.SetActive(false);
+                    ApplyMineArrowTexture(sr);
+                    list.Add(sr);
+                }
+
+                pools["_arrowObjectList"] = list;
+            }
+
+            var breakArrows = Traverse.Create(instance).Field("_breakArrowObjectList").GetValue<List<BreakSlide>>();
+            if (breakArrows != null)
+            {
+                var list = new List<BreakSlide>();
+                foreach (var unused in breakArrows)
+                {
+                    var bs = UnityEngine.Object.Instantiate(GameNotePrefabContainer.BreakArrow);
+                    bs.gameObject.SetActive(false);
+                    ApplyMineBreakArrowTexture(bs);
+                    list.Add(bs);
+                }
+
+                pools["_breakArrowObjectList"] = list;
+            }
+        }
+        catch (Exception e)
+        {
+            MelonLogger.Error($"[CustomNoteType] Failed to create mine arrow pools: {e}");
+        }
+    }
+
+    private static void ApplyMineArrowTexture(SpriteRenderer sr)
+    {
+        if (sr == null || !MineTextures.TryGetValue("slide_mine", out var texture)) return;
+        sr.sprite = CreateSpriteFromTexture("slide_mine", texture, sr.sprite);
+    }
+
+    private static void ApplyMineBreakArrowTexture(BreakSlide bs)
+    {
+        if (bs == null) return;
+        if (bs.SpriteRender != null && MineTextures.TryGetValue("slide_break_mine", out var texture))
+        {
+            bs.SpriteRender.sprite = CreateSpriteFromTexture("slide_break_mine", texture, bs.SpriteRender.sprite);
+        }
+
+        // 光效层（EffectSprite，private）：贴地雷光效 + 标记（SetSprite 会重置，postfix 重贴）。
+        var effect = Traverse.Create(bs).Field("EffectSprite").GetValue<SpriteRenderer>();
+        if (effect != null && MineTextures.TryGetValue("slide_break_eff_mine", out var effTexture))
+        {
+            MineBreakSlides.Add(bs);
+            effect.sprite = CreateSpriteFromTexture("slide_break_eff_mine", effTexture, effect.sprite);
+        }
+    }
+
+    /// <summary>
+    /// 把 slide 的轨道箭头重新贴成地雷贴图。
+    /// 原因：SlideRoot.SetEach（Initialize 内部调用）会给箭头赋原版 NormalSlide/EachSlide sprite，
+    /// 覆盖地雷箭头池的贴图，所以 MineSlideRoot.SetEach override 里要重新贴。
+    /// </summary>
+    public static void ApplyMineArrowTextures(SlideRoot slide)
+    {
+        if (slide == null) return;
+
+        var spriteRenders = Traverse.Create(slide).Field("_spriteRenders").GetValue<List<SpriteRenderer>>();
+        if (spriteRenders != null)
+        {
+            foreach (var sr in spriteRenders)
+            {
+                ApplyMineArrowTexture(sr);
+            }
+        }
+
+        var breakRenders = Traverse.Create(slide).Field("_breakSpriteRenders").GetValue<List<BreakSlide>>();
+        if (breakRenders != null)
+        {
+            foreach (var bs in breakRenders)
+            {
+                ApplyMineBreakArrowTexture(bs);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 给 slide 的移动星（SlideRoot 内部 _starNote / _breakStarNote）贴地雷星贴图。
+    /// 只精准贴这两个星对象（不遍历子物体），普通星用 star_mine、break 星用 star_break_mine。
+    /// </summary>
+    public static void ApplyMineSlideStarTextures(SlideRoot slide)
+    {
+        if (slide == null) return;
+
+        var traverse = Traverse.Create(slide);
+        var star = traverse.Field("_starNote").GetValue<GameObject>();
+        if (star != null)
+        {
+            var sr = star.GetComponent<SpriteRenderer>();
+            if (sr != null) ApplyMineStarTexture(sr, "star_mine");
+        }
+
+        var breakStar = traverse.Field("_breakStarNote").GetValue<GameObject>();
+        if (breakStar != null)
+        {
+            var bs = breakStar.GetComponent<BreakStarNote>();
+            var sr = bs != null ? bs.GetSpriteRender() : breakStar.GetComponent<SpriteRenderer>();
+            if (sr != null) ApplyMineStarTexture(sr, "star_break_mine");
+            // 内部 break 星的 EffectSprite（绝赞光效层）也地雷化——SetSlideStar 在 base.Initialize
+            // 里已执行（此时还没登记），这里直接替换；后续 SetSlideStar 由 postfix 兜底。
+            if (bs != null) MineifyBreakStarEffect(bs);
+        }
+    }
+
+    private static void ApplyMineStarTexture(SpriteRenderer sr, string textureKey)
+    {
+        if (sr == null || !MineTextures.TryGetValue(textureKey, out var texture)) return;
+        sr.sprite = CreateSpriteFromTexture(textureKey, texture, sr.sprite);
+    }
+
+    /// <summary>
+    /// 给 fan slide（Wi-Fi 扇形滑）贴地雷贴图（用户提供的新贴图）：
+    ///   - _spriteLines（11 组 × 2，分 LR）→ slide_fun_mine_00..10（同组 i/2 同号）
+    ///   - _effectSprites（11 组 × 2，光效）→ slide_fun_eff_mine_00..10（同组 i/2 同号）
+    ///   - _spriteStars / _baseSpriteStars（各 3）星 → star_mine / star_break_mine（按 BreakFlag）
+    /// 注意：原版线是白色贴图 + _laneColor 染色（UpdateAlpha 每帧 set_color），
+    /// 地雷线是彩色贴图，MineSlideFan 已 override UpdateAlpha 把 RGB 重置为白（保留 alpha 动画）。
+    /// </summary>
+    public static void ApplyMineFanSlideTextures(SlideFan fan)
+    {
+        if (fan == null) return;
+
+        var traverse = Traverse.Create(fan);
+
+        var lines = traverse.Field("_spriteLines").GetValue<SpriteRenderer[]>();
+        if (lines != null)
+        {
+            for (var i = 0; i < lines.Length; i++)
+            {
+                if (lines[i] == null) continue;
+                // 素材文件名是两位数字：slide_fun_mine_00..10
+                var key = "slide_fun_mine_" + (i / 2 % 11).ToString("D2");
+                if (!MineTextures.TryGetValue(key, out var texture))
+                {
+                    if (!_loggedMissingFanTexture)
+                    {
+                        _loggedMissingFanTexture = true;
+                        MelonLogger.Warning($"[CustomNoteType] Missing fan textures: '{key}'（请确认 LocalAssets/CustomNoteTypes 里有 slide_fun_mine_00..10.png）");
+                    }
+
+                    continue;
+                }
+
+                lines[i].sprite = CreateSpriteFromTexture(key, texture, lines[i].sprite);
+            }
+        }
+
+        var effects = traverse.Field("_effectSprites").GetValue<SpriteRenderer[]>();
+        if (effects != null)
+        {
+            for (var i = 0; i < effects.Length; i++)
+            {
+                if (effects[i] == null) continue;
+                var key = "slide_fun_eff_mine_" + (i / 2 % 11).ToString("D2");
+                if (MineTextures.TryGetValue(key, out var texture))
+                {
+                    effects[i].sprite = CreateSpriteFromTexture(key, texture, effects[i].sprite);
+                }
+            }
+        }
+
+        var isBreak = traverse.Field("BreakFlag").GetValue<bool>();
+        var starKey = isBreak ? "star_break_mine" : "star_mine";
+        var stars = traverse.Field("_spriteStars").GetValue<SpriteRenderer[]>();
+        if (stars != null)
+        {
+            foreach (var sr in stars)
+            {
+                ApplyMineStarTexture(sr, starKey);
+            }
+        }
+
+        var baseStars = traverse.Field("_baseSpriteStars").GetValue<SpriteRenderer[]>();
+        if (baseStars != null)
+        {
+            foreach (var sr in baseStars)
+            {
+                ApplyMineStarTexture(sr, starKey);
+            }
+        }
+
+        // fan 的星（SlideLaneStar = StarNote/BreakStarNote，继承 NoteBase）自带 NoteGuide 提示圈
+        // （蓝色外框 + 判定前橙色闪光）——同样地雷化。
+        ApplyFanStarGuideTextures(traverse);
+
+        // fan 的 break 星（_breakStarObjs，原版 BreakStarNote 实例）的 EffectSprite（绝赞光效层）
+        // 也要地雷化，否则单星判定时闪橙光。SetSlideStar 在 base.Initialize 里已执行
+        // （此时还没登记），这里直接替换；后续 SetSlideStar 由 postfix 兜底。
+        foreach (var field in new[] { "_starObjs", "_breakStarObjs", "_baseStarObjs" })
+        {
+            var objs = traverse.Field(field).GetValue<GameObject[]>();
+            if (objs == null) continue;
+            foreach (var go in objs)
+            {
+                if (go == null) continue;
+                var breakStar = go.GetComponent<BreakStarNote>();
+                if (breakStar != null) MineifyBreakStarEffect(breakStar);
+            }
+        }
+
+        if (!_loggedFanApply)
+        {
+            _loggedFanApply = true;
+            MelonLogger.Msg($"[CustomNoteType] MineSlideFan textures applied: lines={lines?.Length} eff={effects?.Length} stars={stars?.Length} baseStars={baseStars?.Length} key={starKey}");
+        }
+    }
+
+    // 把 fan 星对象（_starObjs / _breakStarObjs / _baseStarObjs）上的 NoteGuide 提示圈地雷化。
+    private static void ApplyFanStarGuideTextures(Traverse fanTraverse)
+    {
+        foreach (var field in new[] { "_starObjs", "_breakStarObjs", "_baseStarObjs" })
+        {
+            var objs = fanTraverse.Field(field).GetValue<GameObject[]>();
+            if (objs == null) continue;
+            foreach (var go in objs)
+            {
+                if (go == null) continue;
+                var noteBase = go.GetComponent<NoteBase>();
+                if (noteBase != null)
+                {
+                    ApplyMineGuideTexture(noteBase);
+                }
+            }
+        }
+    }
+
+    private static bool _loggedFanApply;
+
+    // 原版 CreateNotePool 会给池对象设置 ParentTransform（EndNote 回收时用它做父级）。
+    private static void TrySetParentTransform(Component note, Transform parent)
+    {
+        var prop = note.GetType().GetProperty("ParentTransform");
+        if (prop != null && prop.CanWrite)
+        {
+            prop.SetValue(note, parent);
+            return;
+        }
+
+        var field = note.GetType().GetField("<ParentTransform>k__BackingField",
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+        field?.SetValue(note, parent);
+    }
+
+    // 地雷 Note 取池：当前 RegistNote 需要该字段时返回地雷池/绝赞池，否则返回原版池。
+    private static object GetMinePoolList(GameCtrl instance, string fieldName, System.Type elementType)
+    {
+        if (_activeMineFields.Contains(fieldName))
+        {
+            if (MinePools.TryGetValue(instance, out var pools) && pools.TryGetValue(fieldName, out var pool))
+            {
+                return pool;
+            }
+
+            // 防御：地雷池缺失时返回空列表，避免 RegistNote 抛异常。
+            return Activator.CreateInstance(typeof(List<>).MakeGenericType(elementType));
+        }
+
+        if (_activeCriticalFields.Contains(fieldName))
+        {
+            // 绝赞 touch：有独立池用独立池；没有（如 C 传感器绝赞）回退原版池。
+            if (CriticalTouchPools.TryGetValue(instance, out var criticalPools) &&
+                criticalPools.TryGetValue(fieldName, out var criticalPool))
+            {
+                return criticalPool;
+            }
+
+            return Traverse.Create(instance).Field(fieldName).GetValue();
+        }
+
+        return Traverse.Create(instance).Field(fieldName).GetValue();
+    }
+
+    // 注意：transpiler 替换 ldfld 时栈上是 [instance, "字段名"]（ldstr 在 call 之前），
+    // 所以这些访问器必须接收 (GameCtrl, string) 两个参数，否则字段名字符串会被当作
+    // GameCtrl 弹出导致 InvalidCastException，RegistNote 抛异常、音符全部注册失败。
+    private static List<TapNote> GetTapObjectList(GameCtrl instance, string fieldName) => (List<TapNote>)GetMinePoolList(instance, fieldName, typeof(TapNote));
+    private static List<HoldNote> GetHoldObjectList(GameCtrl instance, string fieldName) => (List<HoldNote>)GetMinePoolList(instance, fieldName, typeof(HoldNote));
+    private static List<BreakHoldNote> GetBreakHoldObjectList(GameCtrl instance, string fieldName) => (List<BreakHoldNote>)GetMinePoolList(instance, fieldName, typeof(BreakHoldNote));
+    private static List<StarNote> GetStarObjectList(GameCtrl instance, string fieldName) => (List<StarNote>)GetMinePoolList(instance, fieldName, typeof(StarNote));
+    private static List<BreakStarNote> GetBreakStarObjectList(GameCtrl instance, string fieldName) => (List<BreakStarNote>)GetMinePoolList(instance, fieldName, typeof(BreakStarNote));
+    private static List<BreakNote> GetBreakObjectList(GameCtrl instance, string fieldName) => (List<BreakNote>)GetMinePoolList(instance, fieldName, typeof(BreakNote));
+    private static List<TouchNoteB> GetTouchBObjectList(GameCtrl instance, string fieldName) => (List<TouchNoteB>)GetMinePoolList(instance, fieldName, typeof(TouchNoteB));
+    private static List<TouchNoteC> GetTouchCTapObjectList(GameCtrl instance, string fieldName) => (List<TouchNoteC>)GetMinePoolList(instance, fieldName, typeof(TouchNoteC));
+    private static List<TouchHoldC> GetTouchBHoldObjectList(GameCtrl instance, string fieldName) => (List<TouchHoldC>)GetMinePoolList(instance, fieldName, typeof(TouchHoldC));
+    private static List<TouchHoldC> GetTouchCHoldObjectList(GameCtrl instance, string fieldName) => (List<TouchHoldC>)GetMinePoolList(instance, fieldName, typeof(TouchHoldC));
+    private static List<SlideRoot> GetSlideObjectList(GameCtrl instance, string fieldName) => (List<SlideRoot>)GetMinePoolList(instance, fieldName, typeof(SlideRoot));
+    private static List<SlideFan> GetFanSlideObjectList(GameCtrl instance, string fieldName) => (List<SlideFan>)GetMinePoolList(instance, fieldName, typeof(SlideFan));
+    private static List<SpriteRenderer> GetArrowObjectList(GameCtrl instance, string fieldName) => (List<SpriteRenderer>)GetMinePoolList(instance, fieldName, typeof(SpriteRenderer));
+    private static List<BreakSlide> GetBreakArrowObjectList(GameCtrl instance, string fieldName) => (List<BreakSlide>)GetMinePoolList(instance, fieldName, typeof(BreakSlide));
+
+    // note 类型（重定向后的基础类型）-> 该类型注册时读取的池字段。
+    private static HashSet<string> GetMineFieldsForNoteType(NotesTypeID.Def type)
+    {
+        switch (type)
+        {
+            case NotesTypeID.Def.Tap:
+            case NotesTypeID.Def.ExTap:
+                return new HashSet<string> { "_tapObjectList" };
+            case NotesTypeID.Def.Hold:
+            case NotesTypeID.Def.ExHold:
+                return new HashSet<string> { "_holdObjectList" };
+            case NotesTypeID.Def.BreakHold:
+            case NotesTypeID.Def.ExBreakHold:
+                return new HashSet<string> { "_breakHoldObjectList" };
+            case NotesTypeID.Def.Star:
+            case NotesTypeID.Def.ExStar:
+                return new HashSet<string> { "_starObjectList" };
+            case NotesTypeID.Def.BreakStar:
+            case NotesTypeID.Def.ExBreakStar:
+                return new HashSet<string> { "_breakStarObjectList" };
+            case NotesTypeID.Def.Break:
+            case NotesTypeID.Def.ExBreakTap:
+                return new HashSet<string> { "_breakObjectList" };
+            case NotesTypeID.Def.Slide:
+            case NotesTypeID.Def.BreakSlide:
+            case NotesTypeID.Def.ExSlide:
+            case NotesTypeID.Def.ExBreakSlide:
+            case NotesTypeID.Def.ConnectSlide:
+                return new HashSet<string> { "_slideObjectList", "_fanSlideObjectList", "_arrowObjectList", "_breakArrowObjectList" };
+            case NotesTypeID.Def.TouchTap:
+                return new HashSet<string> { "_touchBObjectList", "_touchCTapObjectList" };
+            case NotesTypeID.Def.TouchHold:
+                return new HashSet<string> { "_touchBHoldObjectList", "_touchCHoldObjectList" };
+            default:
+                return new HashSet<string>();
+        }
+    }
+
+    [HarmonyTranspiler]
+    [HarmonyPatch(typeof(GameCtrl), "RegistNote")]
+    public static IEnumerable<CodeInstruction> RegistNoteTranspiler(IEnumerable<CodeInstruction> instructions)
+    {
+        foreach (var inst in instructions)
+        {
+            var fieldName = GetLoadedMinePoolFieldName(inst);
+            if (fieldName != null && MinePoolGetters.TryGetValue(fieldName, out var getter))
+            {
+                // ldfld 前栈上是 GameCtrl 实例；改为 ldstr 字段名 + call 访问器，栈形不变。
+                // 和 HoldOnMineTranspiler 同理：被替换的 ldfld 若带分支标签/异常块，必须转移到
+                // 第一条替换指令，否则 DMD 编译报 "Label #N is not marked"。
+                var ldstr = new CodeInstruction(OpCodes.Ldstr, fieldName);
+                ldstr.labels.AddRange(inst.labels);
+                ldstr.blocks.AddRange(inst.blocks);
+                yield return ldstr;
+                yield return new CodeInstruction(OpCodes.Call, getter);
+                continue;
+            }
+
+            yield return inst;
+        }
+    }
+
+    private static string GetLoadedMinePoolFieldName(CodeInstruction inst)
+    {
+        if (inst.opcode != OpCodes.Ldfld || inst.operand == null) return null;
+
+        if (inst.operand is FieldInfo fi)
+        {
+            return Array.IndexOf(MinePoolFieldNames, fi.Name) >= 0 ? fi.Name : null;
+        }
+
+        var nameProp = inst.operand.GetType().GetProperty("Name");
+        var name = nameProp?.GetValue(inst.operand) as string;
+        return name != null && Array.IndexOf(MinePoolFieldNames, name) >= 0 ? name : null;
+    }
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(GameCtrl), "RegistNote")]
+    public static void RegistNotePrefix(GameCtrl __instance, object[] __args)
+    {
+        var note = __args?.FirstOrDefault(a => a is NoteData) as NoteData;
+        var kind = note != null && NoteKinds.TryGetValue(note.indexNote, out var k) ? k : CustomNoteKind.None;
+        _activeMineFields.Clear();
+        _activeCriticalFields.Clear();
+        if (note != null && kind is CustomNoteKind.Mine or CustomNoteKind.MineCriticalTouch)
+        {
+            _activeMineFields.UnionWith(GetMineFieldsForNoteType(note.type.getEnum()));
+        }
+        else if (note != null && kind == CustomNoteKind.CriticalTouch)
+        {
+            // 绝赞 touch：走绝赞独立池（BRTTP 重定向为 NMTTP → TouchTap 字段）。
+            _activeCriticalFields.UnionWith(GetMineFieldsForNoteType(note.type.getEnum()));
+        }
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(GameCtrl), "RegistNote")]
+    public static void RegistNotePostfix(GameCtrl __instance, object[] __args)
+    {
+        _activeMineFields.Clear();
+        _activeCriticalFields.Clear();
+    }
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(GameProcess), "OnStart")]
+    public static void OnGameStartClearHyperSpeed()
+    {
+        SlideDumpReset();
+        NoteSpeedMultipliers.Clear();
+        NoteSpeedByIndex.Clear();
+        PendingNoteSpeedMultipliers.Clear();
+        PendingTouchSpeedMultipliers.Clear();
+        PendingMineFlags.Clear();
+        PendingCriticalFlags.Clear();
+        PendingSvSegments.Clear();
+        SvSegments.Clear();
+        NoteKinds.Clear();
+        MineNoteBehaviour.ClearInstances();
+        MinePools.Clear();
+        CriticalTouchPools.Clear();
+        _activeMineFields.Clear();
+        _activeCriticalFields.Clear();
+        HandledInitializations.Clear();
+        MineGuides.Clear();
+        MineBreakSlides.Clear();
+        MineBreakStars.Clear();
+        MineHoldTouched.Clear();
+        _currentNoteData = null;
+        _optionalSpeedForCurrentLoad = null;
+        _removedOptionalSpeedString = null;
+        _optionalSpeedRemoved = false;
+        _pendingMineForCurrentLoad = false;
+        _pendingCriticalTouchForCurrentLoad = false;
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(GameProcess), "OnRelease")]
+    public static void OnGameReleaseClearHyperSpeed()
+    {
+        NoteSpeedMultipliers.Clear();
+        NoteSpeedByIndex.Clear();
+        PendingNoteSpeedMultipliers.Clear();
+        PendingTouchSpeedMultipliers.Clear();
+        PendingMineFlags.Clear();
+        PendingCriticalFlags.Clear();
+        PendingSvSegments.Clear();
+        SvSegments.Clear();
+        NoteKinds.Clear();
+        MineNoteBehaviour.ClearInstances();
+        MinePools.Clear();
+        CriticalTouchPools.Clear();
+        _activeMineFields.Clear();
+        _activeCriticalFields.Clear();
+        HandledInitializations.Clear();
+        MineGuides.Clear();
+        MineBreakSlides.Clear();
+        MineBreakStars.Clear();
+        MineHoldTouched.Clear();
+        _currentNoteData = null;
+        _optionalSpeedForCurrentLoad = null;
+        _removedOptionalSpeedString = null;
+        _optionalSpeedRemoved = false;
+        _pendingMineForCurrentLoad = false;
+        _pendingCriticalTouchForCurrentLoad = false;
+    }
+
+    [HarmonyPatch]
+    public static class NoteSpeedContextPatch
+    {
+        public static IEnumerable<MethodBase> TargetMethods()
+        {
+            var result = new List<MethodBase>();
+            var baseType = typeof(NoteBase);
+            System.Type[] types;
+            try
+            {
+                types = baseType.Assembly.GetTypes();
+            }
+            catch (ReflectionTypeLoadException e)
+            {
+                types = e.Types.Where(t => t != null).ToArray();
+            }
+
+            foreach (var type in types)
+            {
+                if (type.IsAbstract) continue;
+
+                try
+                {
+                    foreach (var method in type.GetMethods(
+                                 BindingFlags.Public | BindingFlags.NonPublic |
+                                 BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly))
+                    {
+                        if (method.IsAbstract || method.ContainsGenericParameters) continue;
+                        if (method.IsSpecialName) continue;
+
+                        bool isNoteBaseMethod = baseType.IsAssignableFrom(type);
+                        bool hasNoteDataParameter = method.GetParameters()
+                            .Any(p => p.ParameterType == typeof(NoteData));
+
+                        if (isNoteBaseMethod || hasNoteDataParameter)
+                        {
+                            result.Add(method);
+                        }
+                    }
+                }
+                catch
+                {
+                    // Skip types that cannot be reflected safely.
+                }
+            }
+
+            return result;
+        }
+
+        public static void Prefix(object __instance, object[] __args)
+        {
+            NoteData data = null;
+            if (__args != null)
+            {
+                foreach (var arg in __args)
+                {
+                    if (arg is NoteData nd)
+                    {
+                        data = nd;
+                        break;
+                    }
+                }
+            }
+
+            if (data == null && __instance != null)
+            {
+                var traverse = Traverse.Create(__instance);
+                foreach (var fieldName in new[] { "noteData", "_noteData", "NoteData", "data", "_data" })
+                {
+                    var field = traverse.Field(fieldName);
+                    if (field.FieldExists())
+                    {
+                        data = field.GetValue<NoteData>();
+                        if (data != null) break;
+                    }
+                }
+            }
+
+            _currentNoteData = data;
+        }
+    }
+
+    private static float GetFloatField(Traverse t, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            var f = t.Field(name);
+            if (f.FieldExists())
+            {
+                try { return f.GetValue<float>(); } catch { }
+            }
+        }
+        return 0f;
+    }
+
+    private static void SetFloatField(Traverse t, float value, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            var f = t.Field(name);
+            if (f.FieldExists())
+            {
+                try { f.SetValue(value); return; } catch { }
+            }
+        }
+    }
+
+    private static float SanitizeSpeedMultiplier(float multiplier)
+    {
+        // The game does not support zero/negative scroll speed.
+        // Treat them as normal speed to avoid broken notes.
+        return multiplier > 0f ? multiplier : 1f;
+    }
+
+    private static void ApplySpeedToNoteObject(object obj, float multiplier)
+    {
+        if (obj == null) return;
+        multiplier = SanitizeSpeedMultiplier(multiplier);
+        if (multiplier == 1f) return;
+
+        var t = Traverse.Create(obj);
+
+        // Move AppearMsec earlier for slower notes, later for faster notes.
+        var appearMsec = GetFloatField(t, "AppearMsec", "_AppearMsec");
+        var starLaunchMsec = GetFloatField(t, "StarLaunchMsec", "_StarLaunchMsec");
+        if (starLaunchMsec > appearMsec)
+        {
+            var newAppear = starLaunchMsec - (starLaunchMsec - appearMsec) / multiplier;
+            SetFloatField(t, newAppear, "AppearMsec", "_AppearMsec");
+        }
+    }
+
+    [HarmonyPatch]
+    public static class NoteSpeedApplyPatch
+    {
+        public static IEnumerable<MethodBase> TargetMethods()
+        {
+            var result = new List<MethodBase>();
+            System.Type[] types;
+            try
+            {
+                types = typeof(NoteBase).Assembly.GetTypes();
+            }
+            catch (ReflectionTypeLoadException e)
+            {
+                types = e.Types.Where(t => t != null).ToArray();
+            }
+
+            foreach (var type in types)
+            {
+                if (type.IsAbstract) continue;
+
+                try
+                {
+                    foreach (var method in type.GetMethods(
+                                 BindingFlags.Public | BindingFlags.NonPublic |
+                                 BindingFlags.Instance | BindingFlags.DeclaredOnly))
+                    {
+                        if (method.IsAbstract || method.ContainsGenericParameters) continue;
+                        if (method.IsSpecialName) continue;
+                        if (method.Name is not ("Initialize" or "SetData" or "Init")) continue;
+
+                        // Only patch methods that receive a NoteData, e.g. SlideRoot.Initialize(NoteData).
+                        if (method.GetParameters().Any(p => p.ParameterType == typeof(NoteData)))
+                        {
+                            result.Add(method);
+                        }
+                    }
+                }
+                catch
+                {
+                    // Skip types that cannot be reflected safely.
+                }
+            }
+
+            return result;
+        }
+
+        public static void Postfix(object __instance, object[] __args)
+        {
+            NoteData note = null;
+            if (__args != null)
+            {
+                foreach (var arg in __args)
+                {
+                    if (arg is NoteData nd)
+                    {
+                        note = nd;
+                        break;
+                    }
+                }
+            }
+
+            if (note == null && __instance != null)
+            {
+                var traverse = Traverse.Create(__instance);
+                foreach (var fieldName in new[] { "noteData", "_noteData", "NoteData", "data", "_data" })
+                {
+                    var field = traverse.Field(fieldName);
+                    if (field.FieldExists())
+                    {
+                        note = field.GetValue<NoteData>();
+                        if (note != null) break;
+                    }
+                }
+            }
+
+            if (note == null) return;
+
+            TryApplySpeedToNoteObject(__instance, note);
+        }
+    }
+
+
+
+    /*
+     * ========== ========== ========== ========== ========== ========== ========== ==========
+     * 以下内容是为了实现自定义 Slide
+     * 
+     */
+
+    /*
+     * 把 GetSlidePath 和 GetSlideHitArea 和 GetSlideLength 重定向到我可以控制的函数上, 并且多推几个参数进来
+     */
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(SlideRoot), "Initialize")]
+    public static void SlideRootInitApplySpeed(object __instance, object[] __args)
+    {
+        var note = FindNoteDataFromArgs(__instance, __args);
+        if (note == null) return;
+        TryApplySpeedToNoteObject(__instance, note);
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(StarNote), "Initialize")]
+    public static void StarNoteInitApplySpeed(object __instance, object[] __args)
+    {
+        var note = FindNoteDataFromArgs(__instance, __args);
+        if (note == null) return;
+        TryApplySpeedToNoteObject(__instance, note);
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(BreakStarNote), "Initialize")]
+    public static void BreakStarNoteInitApplySpeed(object __instance, object[] __args)
+    {
+        var note = FindNoteDataFromArgs(__instance, __args);
+        if (note == null) return;
+        TryApplySpeedToNoteObject(__instance, note);
+    }
+
+    private static NoteData FindNoteDataFromArgs(object __instance, object[] __args)
+    {
+        if (__args != null)
+        {
+            foreach (var arg in __args)
+            {
+                if (arg is NoteData nd) return nd;
+            }
+        }
+
+        if (__instance != null)
+        {
+            var traverse = Traverse.Create(__instance);
+            foreach (var fieldName in new[] { "noteData", "_noteData", "NoteData", "data", "_data" })
+            {
+                var field = traverse.Field(fieldName);
+                if (field.FieldExists())
+                {
+                    var data = field.GetValue<NoteData>();
+                    if (data != null) return data;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    // Sprite 缓存：以前每次贴图都 Sprite.Create 新建（一个 touchhold 就有 7+ 个子物体），
+    // 音符多的时候 GC 压力大导致卡顿；按（贴图key + 原sprite名）缓存复用。
+    private static readonly Dictionary<string, Sprite> SpriteCache = new Dictionary<string, Sprite>();
+
+    private static Sprite CreateSpriteFromTexture(string textureKey, Texture2D texture, Sprite original)
+    {
+        // ppu 必须沿用原 sprite：固定 1f 会让细长贴图（如 hold 条）尺寸/拉伸全错。
+        var ppu = original != null ? original.pixelsPerUnit : 1f;
+        // 缓存 key 必须包含完整几何信息：图集 sprite 的 name 可能是空的，
+        // 只按 name 缓存会让不同子物体（不同 rect/border）串用同一个 Sprite。
+        var cacheKey = textureKey + "|" +
+            (original != null
+                ? original.name + "|" + original.rect + "|" + original.pivot + "|" + original.border + "|" + ppu
+                : "null");
+        if (SpriteCache.TryGetValue(cacheKey, out var cached))
+        {
+            return cached;
+        }
+
+        var pivot = original != null
+            ? new Vector2(original.pivot.x / original.rect.width, original.pivot.y / original.rect.height)
+            : new Vector2(0.5f, 0.5f);
+        // 9-slice border 必须按新贴图尺寸等比换算：原版 hold 条是 Sliced 渲染（中间段拉伸），
+        // border 是相对原 sprite 的像素值，直接套用会切错位置导致整条被拉伸。
+        var border = Vector4.zero;
+        if (original != null && original.border != Vector4.zero)
+        {
+            var scaleX = texture.width / original.rect.width;
+            var scaleY = texture.height / original.rect.height;
+            border = new Vector4(
+                original.border.x * scaleX,
+                original.border.y * scaleY,
+                original.border.z * scaleX,
+                original.border.w * scaleY);
+        }
+
+        // FullRect 不做 alpha 裁剪，避免 Tight 把细长贴图裁出奇怪的形状。
+        var sprite = Sprite.Create(texture, new Rect(0, 0, texture.width, texture.height), pivot, ppu, 0, SpriteMeshType.FullRect, border);
+        SpriteCache[cacheKey] = sprite;
+        return sprite;
+    }
+
+    // 已地雷化的 NoteGuide（提示圈，共享池对象）。
+    // NoteGuide.SetColor 每次被调用都会把主体 sprite 重置回原版 Guide 贴图，
+    // 所以用 postfix 在 SetColor 后把地雷化的 guide 重新贴回 mine.png。
+    private static readonly HashSet<NoteGuide> MineGuides = new HashSet<NoteGuide>();
+
+    // 把 NoteGuide（提示圈，共享池对象）替换成地雷提示圈（mine.png）。
+    // 已知限制：GuideObj 是共享池对象（_guideObjectList），普通 note 复用时也会是地雷圈
+    // （待办：独立地雷 guide 池，见同目录 TODO.md §2.3）。
+    private static void ApplyMineGuideTexture(NoteBase noteBase)
+    {
+        try
+        {
+            var guide = Traverse.Create(noteBase).Field("GuideObj").GetValue<NoteGuide>();
+            if (!MineTextures.TryGetValue("mine", out var texture)) return;
+
+            if (!_loggedGuideApply)
+            {
+                _loggedGuideApply = true;
+                MelonLogger.Msg($"[CustomNoteType] ApplyMineGuideTexture: note={noteBase.GetType().Name} guide={(guide != null ? guide.gameObject.name : "null")}");
+            }
+
+            if (guide == null) return;
+
+            MineGuides.Add(guide);
+            foreach (var sr in guide.GetComponentsInChildren<SpriteRenderer>(true))
+            {
+                if (sr.sprite == null) continue;
+                sr.sprite = CreateSpriteFromTexture("mine", texture, sr.sprite);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    // 已地雷化的 BreakSlide（break 箭头）——SetSprite 会把 EffectSprite 重置为原版 BreakSlideEff，
+    // 用 postfix 重贴地雷光效。
+    private static readonly HashSet<BreakSlide> MineBreakSlides = new HashSet<BreakSlide>();
+
+    /// <summary>绝赞 touchhold 的 break 风格贴图（BRTHO 绝赞 touchhold / MBTHO 地雷绝赞 touchhold 共用）：
+    /// Red/Yellow/Green/Blue → touchhold_break_0..3，外框 HoldGauge → touchhold_break。</summary>
+    public static void ApplyBreakTouchHoldTextures(Component root)
+    {
+        if (root == null) return;
+        ReplaceChildSprite(root, "Red", "touchhold_break_0");
+        ReplaceChildSprite(root, "Yellow", "touchhold_break_1");
+        ReplaceChildSprite(root, "Green", "touchhold_break_2");
+        ReplaceChildSprite(root, "Blue", "touchhold_break_3");
+        ReplaceChildSprite(root, "HoldGauge", "touchhold_break");
+        ReplaceChildSprite(root, "Point", "touch_break_point_mine");
+    }
+
+    /// <summary>把渲染器贴成地雷光效贴图（绝赞光芒替换用）。</summary>
+    public static void ApplyMineEffectTexture(SpriteRenderer sr, string textureKey)
+    {
+        if (sr == null || !MineTextures.TryGetValue(textureKey, out var texture)) return;
+        sr.sprite = CreateSpriteFromTexture(textureKey, texture, sr.sprite);
+    }
+
+    // 已地雷化的 BreakStarNote（slide/fan 内部单星是原版 BreakStarNote 实例，不是 MineBreakStarNote，
+    // 不能用 `is MineBreakStarNote` 判断——必须登记）。SetSlideStar 会把 EffectSprite（绝赞光效层）
+    // 设为原版 BreakStarEff（橙色闪光），postfix 按登记重贴。
+    private static readonly HashSet<BreakStarNote> MineBreakStars = new HashSet<BreakStarNote>();
+
+    /// <summary>登记一颗地雷 break 星并立刻替换其 EffectSprite（SetMulti/SetSlideStar 可能在登记前已执行）。
+    /// 单星（MultiSlide=false）用 star_break_eff_mine，双星用 star_break_double_eff_mine。</summary>
+    internal static void MineifyBreakStarEffect(BreakStarNote star)
+    {
+        if (star == null) return;
+        MineBreakStars.Add(star);
+        var effect = Traverse.Create(star).Field("EffectSprite").GetValue<SpriteRenderer>();
+        var multi = Traverse.Create(star).Field("MultiSlide").GetValue<bool>();
+        ApplyMineEffectTexture(effect, multi ? "star_break_double_eff_mine" : "star_break_eff_mine");
+    }
+
+    /// <summary>BreakSlide.SetSprite 会把 EffectSprite 重置为原版 BreakSlideEff，地雷箭头重贴。</summary>
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(BreakSlide), "SetSprite")]
+    public static void BreakSlideSetSpritePostfix(BreakSlide __instance)
+    {
+        if (!MineBreakSlides.Contains(__instance)) return;
+        var effect = Traverse.Create(__instance).Field("EffectSprite").GetValue<SpriteRenderer>();
+        ApplyMineEffectTexture(effect, "slide_break_eff_mine");
+    }
+
+    /// <summary>
+    /// BreakStarNote.SetMulti 非虚：地雷 break 星的 EffectSprite（绝赞光效）替换成地雷光效。
+    /// Initialize 对单星/双星都会调 SetMulti（multiFlag = child.Count >= 2），所以两种都要处理：
+    /// 双星 → star_break_double_eff_mine，单星 → star_break_eff_mine。
+    /// 判断用登记表（slide/fan 内部星是原版 BreakStarNote 实例，不是 MineBreakStarNote）。
+    /// </summary>
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(BreakStarNote), "SetMulti")]
+    public static void BreakStarSetMultiPostfix(BreakStarNote __instance, bool multiFlag)
+    {
+        if (!MineBreakStars.Contains(__instance)) return;
+        var effect = Traverse.Create(__instance).Field("EffectSprite").GetValue<SpriteRenderer>();
+        ApplyMineEffectTexture(effect, multiFlag ? "star_break_double_eff_mine" : "star_break_eff_mine");
+    }
+
+    /// <summary>BreakStarNote.SetSlideStar 非虚：地雷单星（独立池或 slide/fan 内部星）的
+    /// 绝赞光效替换成 star_break_eff_mine。内部星是原版 BreakStarNote，用登记表判断。</summary>
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(BreakStarNote), "SetSlideStar")]
+    public static void BreakStarSetSlideStarPostfix(BreakStarNote __instance)
+    {
+        if (!MineBreakStars.Contains(__instance)) return;
+        var effect = Traverse.Create(__instance).Field("EffectSprite").GetValue<SpriteRenderer>();
+        ApplyMineEffectTexture(effect, "star_break_eff_mine");
+    }
+
+    private static bool _loggedGuideApply;
+
+    /// <summary>NoteGuide.SetColor 会把提示圈主体 sprite 重置回原版，地雷化过的 guide 重新贴回。</summary>
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(NoteGuide), "SetColor")]
+    public static void NoteGuideSetColorPostfix(NoteGuide __instance)
+    {
+        if (!MineGuides.Contains(__instance)) return;
+        if (!MineTextures.TryGetValue("mine", out var texture)) return;
+
+        var sr = Traverse.Create(__instance).Field("_spriteRender").GetValue<SpriteRenderer>();
+        if (sr != null)
+        {
+            sr.sprite = CreateSpriteFromTexture("mine", texture, sr.sprite);
+        }
+    }
+
+    private static bool ReplaceChildSprite(Component root, string childName, string textureKey)
+    {
+        if (root == null || !MineTextures.TryGetValue(textureKey, out var texture)) return false;
+
+        var replaced = false;
+        foreach (var sr in root.GetComponentsInChildren<SpriteRenderer>(true))
+        {
+            // 实际 GameObject 名字会带 (Clone)，所以用 StartsWith 匹配。
+            if (sr.gameObject.name.StartsWith(childName, StringComparison.OrdinalIgnoreCase))
+            {
+
+                sr.sprite = CreateSpriteFromTexture(textureKey, texture, sr.sprite);
+                replaced = true;
+            }
+        }
+
+        return replaced;
+    }
+
+    private static void OffsetChildPosition(Component root, string childName, Vector3 offset)
+    {
+        if (root == null) return;
+        foreach (Transform child in root.GetComponentsInChildren<Transform>(true))
+        {
+            if (child.name.StartsWith(childName, StringComparison.OrdinalIgnoreCase))
+            {
+                child.localPosition += offset;
+            }
+        }
+    }
+
+    private static bool ReplaceFirstSprite(Component root, string textureKey)
+    {
+        if (root == null || !MineTextures.TryGetValue(textureKey, out var texture)) return false;
+
+        foreach (var sr in root.GetComponentsInChildren<SpriteRenderer>(true))
+        {
+            if (sr.sprite != null)
+            {
+                sr.sprite = CreateSpriteFromTexture(textureKey, texture, sr.sprite);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public static void ApplyMineTexturesToObject(GameObject go)
+    {
+        if (go == null) return;
+        var root = go.GetComponent<NoteBase>() ?? go.GetComponentInChildren<NoteBase>(true);
+        if (root == null)
+        {
+            // 正常情况下 Note 组件一定在根上；走到这里说明类型或结构异常，记一条日志便于排查。
+            MelonLogger.Warning($"[CustomNoteType] ApplyMineTexturesToObject: no NoteBase on '{go.name}', using Transform fallback");
+            ApplyMineTextures(go.transform, null);
+            return;
+        }
+
+        ApplyMineTextures(root, null);
+    }
+
+    public static void ApplyCriticalTouchTexturesToObject(GameObject go)
+    {
+        if (go == null) return;
+        var root = go.GetComponent<NoteBase>() ?? go.GetComponentInChildren<NoteBase>(true);
+        ApplyCriticalTouchTextures(root != null ? (object)root : go.transform);
+    }
+
+    private static bool _loggedTextureApply;
+
+    private static void ApplyMineTextures(object instance, NoteData note)
+    {
+        if (instance == null) return;
+
+        var root = instance as Component;
+        if (root == null) return;
+
+        // NoteGuide（提示圈）是独立对象（NoteBase.GuideObj，从共享池分配），
+        // 不在 note 的子物体树里——必须单独替换，否则地雷键保留原版蓝色提示圈
+        // 以及判定前的橙色闪光动画（"蓝色外框 + 橙色动效闪光"的来源）。
+        if (root is NoteBase noteBase)
+        {
+            ApplyMineGuideTexture(noteBase);
+        }
+
+        var typeName = instance.GetType().Name;
+        // 每 note 打日志会刷屏卡顿（一个谱几百上千条），只打一次用于验证。
+        if (!_loggedTextureApply)
+        {
+            _loggedTextureApply = true;
+            MelonLogger.Msg($"[CustomNoteType] ApplyMineTextures type={typeName} textures={MineTextures.Count}");
+        }
+
+        var isBreak = typeName.Contains("Break");
+        var replaced = false;
+        string fallbackKey = null;
+
+        // 所有地雷 Note 的提示圈都换成 Mine.png
+        replaced |= ReplaceChildSprite(root, "NoteGuide", "mine");
+
+        if (typeName.Contains("BreakNote"))
+        {
+            // BreakNote = Break Tap
+            fallbackKey = "tap_break_mine";
+            replaced |= ReplaceChildSprite(root, "Break", fallbackKey);
+        }
+        else if (typeName.Contains("Tap"))
+        {
+            fallbackKey = isBreak ? "tap_break_mine" : "tap_mine";
+            replaced |= ReplaceChildSprite(root, isBreak ? "Break" : "Tap", fallbackKey);
+        }
+        else if (typeName.Contains("TouchHold"))
+        {
+            // TouchHold 要在 Hold 之前判断，否则会被当成 Hold。
+            fallbackKey = isBreak ? "touch_break_mine" : "touch_mine";
+            replaced |= ReplaceChildSprite(root, "Red", "touchhold_mine_0");
+            replaced |= ReplaceChildSprite(root, "Yellow", "touchhold_mine_1");
+            replaced |= ReplaceChildSprite(root, "Green", "touchhold_mine_2");
+            replaced |= ReplaceChildSprite(root, "Blue", "touchhold_mine_3");
+            replaced |= ReplaceChildSprite(root, "HoldGauge", isBreak ? "touchhold_break_mine" : "touchhold_off");
+            replaced |= ReplaceChildSprite(root, "Point", isBreak ? "touch_break_point_mine" : "touch_point_mine");
+        }
+        else if (typeName.Contains("Hold"))
+        {
+            fallbackKey = isBreak ? "hold_break_mine" : "hold_mine";
+            replaced |= ReplaceChildSprite(root, "Hold", fallbackKey);
+            replaced |= ReplaceChildSprite(root, "Effect", isBreak ? "hold_break_mine_on" : "hold_mine_on");
+            replaced |= ReplaceChildSprite(root, "HoldEnd", "hold_mine_end");
+        }
+        else if (typeName.Contains("Star"))
+        {
+            fallbackKey = isBreak ? "star_break_mine" : "star_mine";
+            replaced |= ReplaceChildSprite(root, "Star", fallbackKey);
+            replaced |= ReplaceChildSprite(root, "BreakStar", fallbackKey);
+        }
+        else if (typeName.Contains("Slide") || typeName.Contains("Wifi"))
+        {
+            fallbackKey = isBreak ? "slide_break_mine" : "slide_mine";
+            replaced |= ReplaceChildSprite(root, "SlideLaneStar", isBreak ? "star_break_mine" : "star_mine");
+            replaced |= ReplaceChildSprite(root, "SlideArrow", fallbackKey);
+            replaced |= ReplaceChildSprite(root, "BreakSlideArrow", fallbackKey);
+            replaced |= ReplaceChildSprite(root, "Effect", fallbackKey);
+        }
+        else if (typeName.Contains("Touch"))
+        {
+            fallbackKey = isBreak ? "touch_break_mine" : "touch_mine";
+            replaced |= ReplaceChildSprite(root, "Point", isBreak ? "touch_break_point_mine" : "touch_point_mine");
+            replaced |= ReplaceChildSprite(root, "Up", fallbackKey);
+            replaced |= ReplaceChildSprite(root, "Right", fallbackKey);
+            replaced |= ReplaceChildSprite(root, "Down", fallbackKey);
+            replaced |= ReplaceChildSprite(root, "Left", fallbackKey);
+            replaced |= ReplaceChildSprite(root, "Just", fallbackKey);
+
+            // 临时补偿：Down 看起来偏高，往下挪一点。
+            OffsetChildPosition(root, "Down", new Vector3(0f, -3f, 0f));
+        }
+
+        // 如果精确匹配没替换到任何东西，至少把第一个 SpriteRenderer 换掉，避免完全没效果。
+        if (!replaced && fallbackKey != null)
+        {
+            ReplaceFirstSprite(root, fallbackKey);
+        }
+    }
+
+    private static void ApplyCriticalTouchTextures(object instance)
+    {
+        if (instance == null) return;
+
+        var root = instance as Component;
+        if (root == null) return;
+
+        // 绝赞touch：主体用 touch_break，点用 touch_break_point。
+        // 不替换 Just，避免闪橙色光芒。
+        ReplaceChildSprite(root, "Point", "touch_break_point");
+        ReplaceChildSprite(root, "Up", "touch_break");
+        ReplaceChildSprite(root, "Right", "touch_break");
+        ReplaceChildSprite(root, "Down", "touch_break");
+        ReplaceChildSprite(root, "Left", "touch_break");
+
+        // 如果有 Border/Reserve 子物体，分别尝试 border_2 / border_3。
+        var borderRenderers = root.GetComponentsInChildren<SpriteRenderer>(true)
+            .Where(sr => sr.sprite != null &&
+                         (sr.gameObject.name.Contains("Border") || sr.gameObject.name.Contains("Reserve")))
+            .ToArray();
+
+        for (var i = 0; i < borderRenderers.Length; i++)
+        {
+            var key = i == 0 ? "touch_break_border_2" : "touch_break_border_3";
+            if (MineTextures.TryGetValue(key, out var texture))
+            {
+                borderRenderers[i].sprite = CreateSpriteFromTexture(key, texture, borderRenderers[i].sprite);
+            }
+        }
+    }
+
+    // 已处理过的 Initialize（对象 + noteIndex 去重）：
+    // NoteBase.Initialize 与各子类 Initialize 都会触发 NoteSpeedApplyPatch 的 postfix，
+    // 同一个对象同一次初始化会被重复处理（重复贴图/重复缩放速度）。
+    private static readonly Dictionary<Component, int> HandledInitializations = new Dictionary<Component, int>();
+
+    private static bool IsSlideType(NotesTypeID.Def type)
+    {
+        return type is NotesTypeID.Def.Slide or NotesTypeID.Def.BreakSlide or
+            NotesTypeID.Def.ExSlide or NotesTypeID.Def.ExBreakSlide or NotesTypeID.Def.ConnectSlide;
+    }
+
+    private static void TryApplySpeedToNoteObject(object instance, NoteData note)
+    {
+        var component = instance as Component;
+        if (component == null) return;
+
+        // 去重：同一个对象同一 note 只处理一次。
+        if (HandledInitializations.TryGetValue(component, out var handledIndex) && handledIndex == note.indexNote)
+        {
+            return;
+        }
+
+        HandledInitializations[component] = note.indexNote;
+
+        NoteKinds.TryGetValue(note.indexNote, out var kind);
+
+        if (kind != CustomNoteKind.None)
+        {
+            var isMine = kind is CustomNoteKind.Mine or CustomNoteKind.MineCriticalTouch;
+            var isCriticalTouch = kind is CustomNoteKind.CriticalTouch or CustomNoteKind.MineCriticalTouch;
+
+            var go = component.gameObject;
+            // SlideRoot 内部实例化的星（StarNote/BreakStarNote 用 slide 的 NoteData 初始化）
+            // 是 slide 的视觉星，不是独立地雷键：不贴地雷贴图、不挂 behaviour、判定保持原版。
+            var isSlideStar = instance is StarNote or BreakStarNote && IsSlideType(note.type.getEnum());
+            // ISelfJudgingMineNote 独立类贴图/判定自己负责，不需要 MineNoteBehaviour；
+            // Hold/Slide 等非自反转类仍需 behaviour（transpiler 靠它识别地雷）。
+            if (!isSlideStar && !(instance is ISelfJudgingMineNote))
+            {
+                var behaviour = go.GetComponent<MineNoteBehaviour>();
+                if (behaviour == null) behaviour = go.AddComponent<MineNoteBehaviour>();
+                // SlideRoot/SlideFan 的 ApplyMineVisual 会遍历子物体误伤内部星（_starNote），
+                // 所以只挂判定标记不贴图；轨道贴图由独立地雷箭头池负责。
+                var applyTextures = !(instance is MineSlideRoot or SlideFan);
+                behaviour.Setup(note.indexNote, isMine, isCriticalTouch, applyTextures);
+            }
+        }
+
+        float multiplier;
+        if (!NoteSpeedMultipliers.TryGetValue(note, out multiplier) &&
+            !NoteSpeedByIndex.TryGetValue(note.indexNote, out multiplier))
+        {
+            return;
+        }
+
+        ApplySpeedToNoteObject(instance, multiplier);
+    }
+
+    [HarmonyPatch]
+    public static class SlideNoteDataHack
+
+    {
+        public static IEnumerable<MethodBase> TargetMethods()
+        {
+            return
+            [
+                AccessTools.Method(typeof(SlideRoot), "Initialize"),
+                // Temporarily disabled: the IL injection here can crash on built-in slide notes.
+                // （待办：排查崩溃原因后恢复，见同目录 TODO.md §2.5）
+                // AccessTools.Method(typeof(SlideRoot), "GetSlideArrowNum", [typeof(NoteData)]),
+                AccessTools.Method(typeof(StarNote), "Initialize"),
+                AccessTools.Method(typeof(BreakStarNote), "Initialize"),
+            ];
+        }
+
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            var methodGetSlidePath = AccessTools.Method(typeof(SlideManager), "GetSlidePath");
+            var methodGetSlidePathRedirect = AccessTools.Method(typeof(CustomNoteTypes), "GetSlidePathRedirect");
+            var methodGetSlideHitArea = AccessTools.Method(typeof(SlideManager), "GetSlideHitArea");
+            var methodGetSlideHitAreaRedirect = AccessTools.Method(typeof(CustomNoteTypes), "GetSlideHitAreaRedirect");
+            var methodGetSlideLength = AccessTools.Method(typeof(SlideManager), "GetSlideLength");
+            var methodGetSlideLengthRedirect = AccessTools.Method(typeof(CustomNoteTypes), "GetSlideLengthRedirect");
+            var fieldSlideData = AccessTools.Field(typeof(NoteData), "slideData");
+
+            var oldInstList = new List<CodeInstruction>(instructions);
+            var newInstList = new List<CodeInstruction>();
+            CodeInstruction instToInject = null;
+
+            for (var i = 0; i < oldInstList.Count; ++i)
+            {
+                var inst = oldInstList[i];
+                if (inst.LoadsField(fieldSlideData))
+                {
+                    // 以 GetSlidePath 为例, 我们需要把下面这个调用:
+                    // Singleton<SlideManager>.Instance.GetSlidePath(
+                    //     noteData.slideData.type, noteData.startButtonPos,
+                    //     noteData.slideData.targetNote, this.ButtonId
+                    // )
+                    // 里的 noteData 拿到手
+                    // 所以就记录上一次 ldfld NoteData::slideData 的位置, 往前找一个 IL code
+                    // 找到的就是 load 这个 noteData 的位置
+                    // 然后在后续调用 GetSlidePath 时, 先重复一遍 load 把这个 noteData 入栈, 然后重定向到一个新的函数上去
+                    instToInject = oldInstList[i - 1];
+                    newInstList.Add(inst);
+                }
+                else if (inst.Calls(methodGetSlidePath))
+                {
+                    newInstList.Add(instToInject!.Clone());
+                    newInstList.Add(new CodeInstruction(OpCodes.Call, methodGetSlidePathRedirect));
+                    instToInject = null;
+                }
+                else if (inst.Calls(methodGetSlideHitArea))
+                {
+                    newInstList.Add(instToInject!.Clone());
+                    newInstList.Add(new CodeInstruction(OpCodes.Call, methodGetSlideHitAreaRedirect));
+                    instToInject = null;
+                }
+                else if (inst.Calls(methodGetSlideLength))
+                {
+                    newInstList.Add(instToInject!.Clone());
+                    newInstList.Add(new CodeInstruction(OpCodes.Call, methodGetSlideLengthRedirect));
+                    instToInject = null;
+                }
+                else
+                {
+                    newInstList.Add(inst);
+                }
+            }
+            return newInstList;
+        }
+    }
+
+
+    public static List<Vector4> GetSlidePathRedirect(SlideManager instance, SlideType slideType, int start, int end,
+        int starButton, NoteData noteData)
+    {
+        // MelonLogger.Msg($"[CustomNoteType] GetSlidePath Redirected!");
+        // MelonLogger.Msg($"{noteData.indexNote} {noteData.indexSlide} {slideType} {start} {end} {starButton}");
+        if (noteData is CustomSlideNoteData data)
+        {
+            // MelonLogger.Msg($"[CustomNoteType] Successfully injected custom path {data.SlideCode}");
+            return data.SlidePathList[starButton];
+        }
+        return instance.GetSlidePath(slideType, start, end, starButton);
+    }
+
+    public static List<SlideManager.HitArea> GetSlideHitAreaRedirect(SlideManager instance, SlideType slideType,
+        int start, int end, int starButton, NoteData noteData)
+    {
+        // MelonLogger.Msg($"[CustomNoteType] GetSlideHitArea Redirected!");
+        // MelonLogger.Msg($"{noteData.indexNote} {noteData.indexSlide} {slideType} {start} {end} {starButton}");
+        if (noteData is CustomSlideNoteData data)
+        {
+            // MelonLogger.Msg($"[CustomNoteType] Successfully injected custom hit areas {data.SlideCode}");
+            return data.SlideHitAreasList[starButton];
+        }
+        return instance.GetSlideHitArea(slideType, start, end, starButton);
+    }
+
+    public static float GetSlideLengthRedirect(SlideManager instance, SlideType slideType,
+        int start, int end, NoteData noteData)
+    {
+        // MelonLogger.Msg($"[CustomNoteType] GetSlideLength Redirected!");
+        // MelonLogger.Msg($"{noteData.indexNote} {noteData.indexSlide} {slideType} {start} {end}");
+        if (noteData is CustomSlideNoteData data)
+        {
+            // MelonLogger.Msg($"[CustomNoteType] Successfully injected custom path length {data.SlideCode}");
+            return data.SlidePathLength;
+        }
+        return instance.GetSlideLength(slideType, start, end);
+    }
+
+
+
+}
+
