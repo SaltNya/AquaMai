@@ -27,6 +27,7 @@
 
 判定:
   - GameSettings.JudgeAdjust
+  - UX.JudgeDisplayPro
   - UX.JudgeAccuracyInfo
   - Utils.UnstableRate
   - Utils.DisplayTouchInGame
@@ -42,6 +43,7 @@
   - GameSystem.Sound
   - GameSystem.SoundRouting
   - GameSystem.HeadphoneVolumeMultiply
+  - GameSystem.HeadphoneVolumeOverride
   - GameSystem.VolumeSync
   - Utils.MoveAnswerSound
 
@@ -67,6 +69,7 @@
   - UX.QuickEndPlay
   - UX.OneKeyEntryEnd
   - UX.OneKeyRetrySkip
+  - Utils.EarlyContinue
 
 选曲界面:
   - UX.HideSelfMadeCharts
@@ -118,6 +121,7 @@
   - Fancy.GamePlay.TapInHoldFix
   - Fancy.TrackCamouflage
   - Fancy.ResourcesOverride
+  - Fancy.SkipGameResultAnimation
 
 不建议关闭:
   - UX.ImmediateSave

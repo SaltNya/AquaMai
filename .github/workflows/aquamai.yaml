@@ -3,46 +3,19 @@ name: AquaMai Build
 on:
   workflow_dispatch:
   push:
-  pull_request_target:
+  pull_request:
 
 permissions:
   contents: read
 
-env:
-  BUILD_DEPENDENCIES_CACHE_KEY: AquaMai-build-dependencies-v1
+concurrency:
+  group: aquamai-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build-dependencies:
-    if: github.event_name != 'pull_request_target'
-    runs-on: windows-latest
-    steps:
-      - name: Checkout build dependencies
-        uses: clansty/checkout@main
-        with:
-          repository: MuNET-OSS/AquaMai-Build-Assets
-          ssh-key: ${{ secrets.BUILD_ASSETS_KEY }}
-          path: build-assets
-          max-attempts: 50
-          min-retry-interval: 1
-          max-retry-interval: 5
-
-      - name: Stage build dependencies
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path "build-dependencies/SDEZ" -Force | Out-Null
-          Copy-Item -Path "build-assets/SDEZ/AMDaemon.NET.dll" -Destination "build-dependencies/SDEZ/AMDaemon.NET.dll" -Force
-          Copy-Item -Path "build-assets/SDEZ/Assembly-CSharp.dll" -Destination "build-dependencies/SDEZ/Assembly-CSharp.dll" -Force
-
-      - name: Save build dependencies cache
-        uses: actions/cache/save@v4
-        with:
-          key: ${{ env.BUILD_DEPENDENCIES_CACHE_KEY }}
-          path: build-dependencies/SDEZ
-
   build:
-    needs: build-dependencies
-    if: always() && (needs.build-dependencies.result == 'success' || needs.build-dependencies.result == 'skipped')
     runs-on: windows-latest
+    timeout-minutes: 20
     outputs:
       git_describe: ${{ steps.git-describe.outputs.git_describe }}
     steps:
@@ -51,33 +24,36 @@ jobs:
           git config --global core.autocrlf false
           git config --global core.eol lf
 
-      - name: Checkout pull request source
-        if: github.event_name == 'pull_request_target'
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: source
-          persist-credentials: false
-
       - name: Checkout source
-        if: github.event_name != 'pull_request_target'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.sha }}
           path: source
           persist-credentials: false
 
-      - name: Checkout trusted scripts
-        if: github.event_name == 'pull_request_target'
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.event.pull_request.base.repo.full_name }}
-          ref: ${{ github.event.pull_request.base.sha }}
-          path: trusted-source
-          persist-credentials: false
+      - name: Download build references
+        shell: pwsh
+        env:
+          REFERENCE_ARCHIVE_URL: ${{ vars.AQUAMAI_CI_REFERENCE_URL }}
+          REFERENCE_ARCHIVE_SHA256: ${{ vars.AQUAMAI_CI_REFERENCE_SHA256 }}
+        run: |
+          $archivePath = Join-Path $env:RUNNER_TEMP "aquamai-ci-reference.zip"
+          Invoke-WebRequest -Uri $env:REFERENCE_ARCHIVE_URL -OutFile $archivePath
+
+          $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedHash = $env:REFERENCE_ARCHIVE_SHA256.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "Reference archive SHA256 mismatch: expected $expectedHash, got $actualHash"
+          }
+
+          New-Item -ItemType Directory -Path "source/Libs" -Force | Out-Null
+          Expand-Archive -LiteralPath $archivePath -DestinationPath "source/Libs" -Force
+
+          @("AMDaemon.NET.dll", "Assembly-CSharp.dll") | ForEach-Object {
+            if (-not (Test-Path -LiteralPath "source/Libs/$_" -PathType Leaf)) {
+              throw "Reference archive is missing $_"
+            }
+          }
 
       - name: Get Git Describe
         id: git-describe
@@ -95,24 +71,10 @@ jobs:
           "GIT_DESCRIBE=$raw" >> $env:GITHUB_ENV
           "git_describe=$raw" >> $env:GITHUB_OUTPUT
 
-      - name: Restore build dependencies cache
-        uses: actions/cache/restore@v4
-        with:
-          key: ${{ env.BUILD_DEPENDENCIES_CACHE_KEY }}
-          path: build-dependencies/SDEZ
-          fail-on-cache-miss: true
-
       - name: Build AquaMai
         shell: pwsh
         working-directory: source
-        run: |
-          New-Item -ItemType Directory -Path "Libs" -Force | Out-Null
-          Copy-Item -Path "../build-dependencies/SDEZ/*" -Destination "Libs" -Force
-          if ("${{ github.event_name }}" -eq "pull_request_target") {
-            & ../trusted-source/build.ps1 -SourceRoot .
-          } else {
-            & ./build.ps1
-          }
+        run: ./build.ps1
 
       - name: Prepare artifact
         shell: pwsh
@@ -123,15 +85,25 @@ jobs:
           Move-Item -Path "Output/AquaMai.zh.toml" -Destination "Output/Upload/AquaMai.zh.toml" -Force
           Move-Item -Path "Output/AquaMai.en.toml" -Destination "Output/Upload/AquaMai.en.toml" -Force
 
+      - name: Upload config sort check input
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-sort-check-input
+          path: |
+            source/checkSort.py
+            source/AquaMai/configSort.yaml
+            source/Output/Upload/AquaMai.zh.toml
+
       - name: Upload unsigned artifact
-        if: github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
           name: AquaMai-unsigned
           path: source/Output/Upload
 
       - name: Upload artifact
-        if: github.event_name == 'pull_request_target' || github.ref != 'refs/heads/main'
+        if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
           name: AquaMai
@@ -139,7 +111,7 @@ jobs:
 
   release:
     needs: build
-    if: github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: windows-latest
     steps:
       - name: Download unsigned artifact
@@ -196,3 +168,29 @@ jobs:
             aquamai_en = Get-Item Output\Upload\AquaMai.en.toml
           }
           Invoke-RestMethod -Uri $uri -Form $Form -Method Post
+
+  check-sort:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download check input
+        uses: actions/download-artifact@v4
+        with:
+          name: config-sort-check-input
+          path: check-input
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install PyYAML==6.0.2
+
+      - name: Check config sort
+        working-directory: check-input
+        run: |
+          mkdir -p Output
+          mv Output/Upload/AquaMai.zh.toml Output/AquaMai.zh.toml
+          python checkSort.py
